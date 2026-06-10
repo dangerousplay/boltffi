@@ -93,7 +93,15 @@ impl NativeHostToolchain {
         jni_compiler_override: Option<&str>,
         glibc_version: Option<&str>,
     ) -> Result<Self> {
-        Self::discover_for_platform(toolchain_selector, cargo_args, target, current_host, "JVM")
+        Self::discover_for_platform(
+            toolchain_selector,
+            cargo_args,
+            target,
+            current_host,
+            "JVM",
+            jni_compiler_override,
+            glibc_version,
+        )
     }
 
     pub fn discover_csharp(
@@ -108,6 +116,8 @@ impl NativeHostToolchain {
             target.into(),
             current_host.into(),
             "C#",
+            None,
+            None,
         )
     }
 
@@ -140,6 +150,8 @@ impl NativeHostToolchain {
         target: JavaHostTarget,
         current_host: JavaHostTarget,
         platform_name: &str,
+        jni_compiler_override: Option<&str>,
+        glibc_version: Option<&str>,
     ) -> Result<Self> {
         ensure_supported_native_host_pair(current_host, target, platform_name)?;
         let rust_target_triple =

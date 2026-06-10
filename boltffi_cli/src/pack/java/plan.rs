@@ -489,6 +489,7 @@ fn print_validated_toolchains(packaging_targets: &[JvmPackagingTarget]) {
         let ctx = &target.cargo_context;
         let host = ctx.host_target.canonical_name();
         let triple = target.toolchain.rust_target_triple();
+        let compiler = target.toolchain.jni_compiler_command_display();
         let build_cmd = ctx
             .cargo_build_command
             .as_ref()
@@ -498,7 +499,9 @@ fn print_validated_toolchains(packaging_targets: &[JvmPackagingTarget]) {
             Some(v) => format!(", glibc {v}"),
             None => String::new(),
         };
-        println!("      {host}: triple={triple}{glibc_info}, build={build_cmd}");
+        println!(
+            "      {host}: triple={triple}{glibc_info}, build={build_cmd}, jni_compiler={compiler}"
+        );
     }
 }
 
@@ -553,6 +556,8 @@ fn resolve_jvm_packaging_targets(
                 &cargo_command_args,
                 host_target,
                 current_host,
+                config.java_jvm_jni_compiler(),
+                jvm_host_target.glibc_version.as_deref(),
             )?;
             let cargo_context = JvmCargoContext {
                 host_target,
@@ -807,7 +812,7 @@ mod tests {
                 },
                 cargo_build_command: None,
             },
-            toolchain: NativeHostToolchain::discover(None, &[], current_host, current_host)
+            toolchain: NativeHostToolchain::discover(None, &[], current_host, current_host, None, None)
                 .expect("native host toolchain"),
         }];
 
