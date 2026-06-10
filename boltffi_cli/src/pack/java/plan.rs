@@ -272,7 +272,7 @@ fn prepare_jvm_packaging_matrix(
     )?;
 
     Ok(PreparedJvmPackaging {
-        host_targets,
+        host_targets: host_targets.iter().map(|t| t.target).collect(),
         packaging_targets,
     })
 }
@@ -489,7 +489,6 @@ fn print_validated_toolchains(packaging_targets: &[JvmPackagingTarget]) {
         let ctx = &target.cargo_context;
         let host = ctx.host_target.canonical_name();
         let triple = target.toolchain.rust_target_triple();
-        let compiler = target.toolchain.jni_compiler_command_display();
         let build_cmd = ctx
             .cargo_build_command
             .as_ref()
@@ -499,9 +498,7 @@ fn print_validated_toolchains(packaging_targets: &[JvmPackagingTarget]) {
             Some(v) => format!(", glibc {v}"),
             None => String::new(),
         };
-        println!(
-            "      {host}: triple={triple}{glibc_info}, build={build_cmd}, jni_compiler={compiler}"
-        );
+        println!("      {host}: triple={triple}{glibc_info}, build={build_cmd}");
     }
 }
 
@@ -556,8 +553,6 @@ fn resolve_jvm_packaging_targets(
                 &cargo_command_args,
                 host_target,
                 current_host,
-                config.java_jvm_jni_compiler(),
-                jvm_host_target.glibc_version.as_deref(),
             )?;
             let cargo_context = JvmCargoContext {
                 host_target,
@@ -599,7 +594,7 @@ mod tests {
     use crate::cli::CliError;
     use crate::config::{CargoConfig, Config, PackageConfig, TargetsConfig};
     use crate::pack::java::link::JvmPackagedNativeOutput;
-    use crate::target::JavaHostTarget;
+    use crate::target::{JavaHostTarget, JavaJvmHostTarget};
     use crate::toolchain::NativeHostToolchain;
 
     fn temporary_directory(prefix: &str) -> PathBuf {
@@ -637,7 +632,7 @@ mod tests {
 
     fn config_with_host_targets(
         java_enabled: bool,
-        host_targets: Vec<JavaHostTarget>,
+        host_targets: Vec<JavaJvmHostTarget>,
         strip_symbols: bool,
     ) -> Config {
         let mut config = config(java_enabled);
@@ -710,12 +705,17 @@ mod tests {
     #[test]
     fn rejects_windows_strip_symbols_during_preflight() {
         let error = match resolve_jvm_packaging_targets(
-            &config_with_host_targets(true, vec![JavaHostTarget::WindowsX86_64], true),
+            &config_with_host_targets(
+                true,
+                vec![JavaJvmHostTarget::new(JavaHostTarget::WindowsX86_64)],
+                true,
+            ),
             &[],
             false,
             CargoBuildProfile::Named("dist".to_string()),
-            &[JavaHostTarget::WindowsX86_64],
+            &[JavaJvmHostTarget::new(JavaHostTarget::WindowsX86_64)],
             true,
+            None,
         ) {
             Ok(_) => panic!("expected unsupported windows strip config to fail during preflight"),
             Err(error) => error,
@@ -725,6 +725,63 @@ mod tests {
             error,
             CliError::CommandFailed { status: None, .. }
         ));
+    }
+
+    fn cargo_context_for(
+        host_target: JavaHostTarget,
+        rust_target_triple: &str,
+        glibc_version: Option<&str>,
+    ) -> JvmCargoContext {
+        JvmCargoContext {
+            host_target,
+            rust_target_triple: rust_target_triple.to_string(),
+            glibc_version: glibc_version.map(str::to_owned),
+            release: false,
+            build_profile: CargoBuildProfile::Debug,
+            artifact_name: "demo".to_string(),
+            cargo_manifest_path: PathBuf::from("/tmp/Cargo.toml"),
+            manifest_path: PathBuf::from("/tmp/Cargo.toml"),
+            package_selector: None,
+            target_directory: PathBuf::from("/tmp/target"),
+            cargo_command_args: Vec::new(),
+            toolchain_selector: None,
+            crate_outputs: JvmCrateOutputs {
+                builds_staticlib: true,
+                builds_cdylib: true,
+            },
+            cargo_build_command: None,
+        }
+    }
+
+    #[test]
+    fn cargo_target_arg_appends_glibc_suffix_for_linux_targets() {
+        let ctx = cargo_context_for(
+            JavaHostTarget::LinuxX86_64,
+            "x86_64-unknown-linux-gnu",
+            Some("2.17"),
+        );
+        assert_eq!(ctx.cargo_target_arg(), "x86_64-unknown-linux-gnu.2.17");
+
+        let ctx = cargo_context_for(
+            JavaHostTarget::LinuxAarch64,
+            "aarch64-unknown-linux-gnu",
+            Some("2.28"),
+        );
+        assert_eq!(ctx.cargo_target_arg(), "aarch64-unknown-linux-gnu.2.28");
+    }
+
+    #[test]
+    fn cargo_target_arg_omits_glibc_suffix_when_unset_or_non_linux() {
+        let ctx = cargo_context_for(JavaHostTarget::LinuxX86_64, "x86_64-unknown-linux-gnu", None);
+        assert_eq!(ctx.cargo_target_arg(), "x86_64-unknown-linux-gnu");
+
+        // A glibc version is meaningless for non-Linux hosts and must be ignored.
+        let ctx = cargo_context_for(
+            JavaHostTarget::WindowsX86_64,
+            "x86_64-pc-windows-msvc",
+            Some("2.17"),
+        );
+        assert_eq!(ctx.cargo_target_arg(), "x86_64-pc-windows-msvc");
     }
 
     #[test]
@@ -750,7 +807,7 @@ mod tests {
                 },
                 cargo_build_command: None,
             },
-            toolchain: NativeHostToolchain::discover(None, &[], current_host, current_host, None, None)
+            toolchain: NativeHostToolchain::discover(None, &[], current_host, current_host)
                 .expect("native host toolchain"),
         }];
 

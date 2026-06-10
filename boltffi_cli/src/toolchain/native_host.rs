@@ -242,10 +242,6 @@ impl NativeHostToolchain {
         &self.rust_target_triple
     }
 
-    pub fn jni_compiler_program(&self) -> &Path {
-        &self.jni_compiler_program
-    }
-
     pub fn configure_cargo_build(&self, command: &mut Command) {
         if let Some((key, value)) = self.cargo_linker_env.as_ref() {
             command.env(key, value);
