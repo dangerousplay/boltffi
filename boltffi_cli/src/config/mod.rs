@@ -13,7 +13,7 @@ pub mod experimental;
 pub mod symbols;
 pub mod targets;
 
-pub use cargo::{CargoConfig, PackageConfig};
+pub use cargo::{CargoBuildCommand, CargoConfig, CargoOperation, PackageConfig};
 pub use experimental::Experimental;
 pub use symbols::{DebugSymbolsBundle, DebugSymbolsConfig, DebugSymbolsFormat};
 pub use targets::{

@@ -9,7 +9,9 @@ use crate::cli::{CliError, Result};
 use crate::commands::generate::java::TargetGeneration;
 use crate::commands::generate::run_generate_java_with_generations;
 use crate::commands::pack::{PackExecutionOptions, PackJavaOptions};
-use crate::config::{Config, DebugSymbolsBundle, DebugSymbolsFormat, TargetSection};
+use crate::config::{
+    CargoBuildCommand, Config, DebugSymbolsBundle, DebugSymbolsFormat, TargetSection,
+};
 use crate::pack::resolve_build_cargo_args;
 use crate::pack::symbols::{
     DebugSymbolArtifact, DebugSymbolArtifactKind, ensure_debug_symbols_profile_has_debuginfo,
@@ -38,6 +40,7 @@ pub(crate) struct JvmCargoContext {
     pub(crate) target_directory: PathBuf,
     pub(crate) cargo_command_args: LibraryCargoArgs,
     pub(crate) toolchain_selector: Option<String>,
+    pub(crate) build_command: CargoBuildCommand,
 }
 
 pub(crate) struct JvmPackagingTarget {
@@ -529,6 +532,7 @@ fn resolve_jvm_packaging_targets(
                 target_directory: metadata.target_directory.clone(),
                 cargo_command_args: cargo_command_args.clone(),
                 toolchain_selector: toolchain_selector.clone(),
+                build_command: config.cargo.build_command.clone(),
             };
             let _ = resolve_jni_include_directories(&cargo_context)?;
             Ok(JvmPackagingTarget {

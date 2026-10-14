@@ -68,6 +68,31 @@ cargo_args = ["--no-default-features", "--features=kotlin"]
 
 Arguments are passed in this order: `global_args`, `command_args`, the target's `cargo_args`, then any `--cargo-arg` values from the command line.
 
+### Build Command
+
+`build_command` picks the program that runs library builds. Use it to build through [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild) or [cross](https://github.com/cross-rs/cross) instead of plain `cargo`:
+
+```toml
+[cargo]
+build_command = "zigbuild"
+```
+
+| Value | Build | `rustc` builds |
+|-------|-------|----------------|
+| `"cargo"` (default) | `cargo build` | `cargo rustc` |
+| `"zigbuild"` | `cargo-zigbuild zigbuild` | `cargo-zigbuild rustc` |
+| `"cross"` | `cross build` | `cross rustc` |
+| `"<program>"` | `<program> build` | `<program> rustc` |
+| `"<program> <subcommand…>"` | `<program> <subcommand…>` | `<program> <subcommand…>` |
+
+`rustc` builds are the library builds that pass rustc flags: binding-expanded builds, the `pack java` JVM build and its link probes, and the binding metadata build. A custom subcommand is used for both kinds, so it must accept `cargo rustc` arguments. A `+toolchain` selector is passed as an argument only to `cargo`; other programs receive it as `RUSTUP_TOOLCHAIN`. `pack csharp` and `pack python` still build with `cargo`.
+
+The `--cargo-build-cmd` flag overrides the config for one run:
+
+```bash
+boltffi --cargo-build-cmd cross pack java
+```
+
 Each command reads the `cargo_args` of one target table:
 
 - `generate kotlin` and `pack android` use `[targets.android]`. `generate header` uses only the `[cargo]` arguments, but the header step of `pack android` also gets `[targets.android].cargo_args`.

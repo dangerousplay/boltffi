@@ -62,6 +62,21 @@ Extra arguments for the `cargo` invocations `boltffi` runs.
   - Default: `[]`
 - `command_args` (table of string arrays): Arguments keyed by `boltffi` command. `build` applies to `boltffi build` and `boltffi pack`; `build` and `generate` both apply to `boltffi generate`.
   - Default: `{}`
+- `build_command` (string): Program that runs library builds. The global `--cargo-build-cmd <CMD>` flag overrides it.
+  - Default: `"cargo"`
+  - Values:
+
+    | Value | Build | `rustc` builds |
+    |-------|-------|----------------|
+    | `"cargo"` | `cargo build` | `cargo rustc` |
+    | `"zigbuild"` (also `"cargo zigbuild"`, `"cargo-zigbuild"`) | `cargo-zigbuild zigbuild` | `cargo-zigbuild rustc` |
+    | `"cross"` (also `"cross build"`) | `cross build` | `cross rustc` |
+    | `"<program>"` | `<program> build` | `<program> rustc` |
+    | `"<program> <subcommand…>"` | `<program> <subcommand…>` | `<program> <subcommand…>` |
+
+  - `rustc` builds are binding-expansion library builds, the `pack java` JVM build, its `--print=native-static-libs` / `--print=file-names` probes, and the binding metadata build. A custom subcommand is used for both kinds, so it must accept `cargo rustc` arguments (`--lib`, `-- <rustc flags>`).
+  - A `+toolchain` selector is passed as an argument only when the program is `cargo`; other programs get it as `RUSTUP_TOOLCHAIN`.
+  - The `pack csharp` and `pack python` library builds, `cargo metadata`, and the `pack wasm` target-feature probe always use `cargo`.
 
 Each `[targets.<name>]` table listed below also accepts `cargo_args` (array of strings, default `[]`), applied wherever that target builds:
 
@@ -93,6 +108,7 @@ Arguments are passed in this order: `global_args`, `command_args`, the target's 
 ```toml
 [cargo]
 global_args = ["--locked"]
+build_command = "zigbuild"
 
 [targets.python]
 enabled = true

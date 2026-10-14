@@ -455,6 +455,8 @@ Current Phase 4 support is intentionally narrow:
 
 For the macOS to Linux desktop case, install the Rust target and provide a Linux linker that Cargo can use, for example via `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER` or `BOLTFFI_JAVA_LINKER_X86_64_UNKNOWN_LINUX_GNU`.
 
+To run the JVM build, its link probes and the metadata build through `cargo-zigbuild` or `cross`, set `[cargo].build_command` or pass `--cargo-build-cmd` (see [Configuration](/docs/configuration#build-command)).
+
 Cross-host JNI compilation also needs target-appropriate JNI headers. If the active `JAVA_HOME` does not contain the target platform header directory, point BoltFFI at a target-specific JDK or header directory:
 
 - `BOLTFFI_JAVA_HOME_X86_64_UNKNOWN_LINUX_GNU=/path/to/linux-jdk`
