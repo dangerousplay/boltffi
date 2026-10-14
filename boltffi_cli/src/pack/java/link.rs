@@ -975,7 +975,14 @@ pub(crate) fn clang_style_jni_linker_args(args: &JniLinkerArgs<'_>) -> Vec<Strin
     resolved_args.extend([
         "-o".to_string(),
         args.output_lib.display().to_string(),
+        // The glue uses the C JNI API and implicit void* conversions, so force
+        // C even when the driver is a C++ frontend (g++, clang++), then restore
+        // extension-based detection for the inputs that follow.
+        "-x".to_string(),
+        "c".to_string(),
         args.jni_glue.display().to_string(),
+        "-x".to_string(),
+        "none".to_string(),
     ]);
     resolved_args.extend(clang_link_input_args(args.host_target, args.link_input));
     resolved_args.extend([
@@ -1859,7 +1866,11 @@ mod tests {
                 "-fPIC".to_string(),
                 "-o".to_string(),
                 "/tmp/out/libdemo_jni.dylib".to_string(),
+                "-x".to_string(),
+                "c".to_string(),
                 "/tmp/jni/jni_glue.c".to_string(),
+                "-x".to_string(),
+                "none".to_string(),
                 "-Wl,-force_load,/tmp/target/libdemo.a".to_string(),
                 "-I/tmp/jni".to_string(),
                 "-I/tmp/jdk/include".to_string(),
