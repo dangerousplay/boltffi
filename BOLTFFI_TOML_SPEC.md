@@ -363,6 +363,7 @@ Desktop JVM target configuration.
   - Other programs get the target flags BoltFFI adds to the compiler it discovers (`--target <triple>` for clang drivers when cross-compiling, `-target`/`-isysroot` on macOS); MSVC drivers (`cl`, `clang-cl`) keep MSVC-style arguments.
   - Takes precedence over `CARGO_TARGET_<TRIPLE>_LINKER`, cargo `target.<triple>.linker` and `BOLTFFI_JAVA_LINKER_<TRIPLE>` for the JNI library. Those values still configure the Rust linker; on macOS → `linux-x86_64` no separate cross linker is required when `jni_compiler` is set (the build command, e.g. `zigbuild`, links the Rust library).
   - Default: unset (discover `clang` / the configured linker)
+  - Linux hosts can package the other Linux architecture (`linux-x86_64` ↔ `linux-aarch64`). That needs `jni_compiler` (e.g. `"zig cc"` with `[cargo].build_command = "zigbuild"`), a configured linker (`CARGO_TARGET_<TRIPLE>_LINKER`, cargo `target.<triple>.linker`, `BOLTFFI_JAVA_LINKER_<TRIPLE>`), or a target-prefixed cross compiler in `PATH` (`aarch64-linux-gnu-clang`/`-gcc`, `x86_64-linux-gnu-clang`/`-gcc`). With `build_command = "cargo"` a configured or discovered cross linker is required for the Rust library.
 - `strip_symbols` (bool): Strip symbol tables from packaged desktop JNI libraries for custom named Cargo profiles used with `boltffi pack java`.
   - Default: `false`
   - Currently supported for Darwin and Linux desktop JNI packaging only.
