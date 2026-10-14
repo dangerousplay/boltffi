@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::DebugSymbolsConfig;
 use crate::config::targets::kotlin::default_android_min_sdk;
-use crate::target::JavaHostTarget;
+use crate::target::JavaJvmHostTarget;
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct JavaConfig {
@@ -26,7 +26,7 @@ pub struct JavaJvmConfig {
     pub enabled: bool,
     #[serde(default = "default_java_jvm_output")]
     pub output: PathBuf,
-    pub host_targets: Option<Vec<JavaHostTarget>>,
+    pub host_targets: Option<Vec<JavaJvmHostTarget>>,
     #[serde(default)]
     pub strip_symbols: bool,
     #[serde(default)]

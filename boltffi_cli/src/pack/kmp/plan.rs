@@ -134,6 +134,7 @@ mod tests {
                     .unwrap(),
                     toolchain_selector: Some("+nightly".to_string()),
                     build_command: CargoBuildCommand::Cargo,
+                    glibc_version: None,
                 },
                 toolchain: NativeHostToolchain::discover(
                     None,

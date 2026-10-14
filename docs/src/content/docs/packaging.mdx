@@ -464,6 +464,19 @@ For the macOS to Linux desktop case, install the Rust target and provide a Linux
 
 To run the JVM build, its link probes and the metadata build through `cargo-zigbuild` or `cross`, set `[cargo].build_command` or pass `--cargo-build-cmd` (see [Configuration](/docs/configuration#build-command)).
 
+To ship a Linux library that loads on older distributions, add a glibc version to the Linux host target and build through `cargo-zigbuild`:
+
+```toml
+[cargo]
+build_command = "zigbuild"
+
+[targets.java.jvm]
+enabled = true
+host_targets = ["linux-x86_64.2.17"]
+```
+
+The Rust library is built with `--target x86_64-unknown-linux-gnu.2.17`, so it only references glibc 2.17 symbols; the output still lands in `dist/java/native/linux-x86_64/`. The JNI library is linked by the JNI compiler (`clang`), which must target the same glibc version, for example through a `clang` wrapper that runs `zig cc -target x86_64-linux-gnu.2.17`. `cargo` and `cross` do not understand the suffix and are rejected.
+
 Cross-host JNI compilation also needs target-appropriate JNI headers. If the active `JAVA_HOME` does not contain the target platform header directory, point BoltFFI at a target-specific JDK or header directory:
 
 - `BOLTFFI_JAVA_HOME_X86_64_UNKNOWN_LINUX_GNU=/path/to/linux-jdk`

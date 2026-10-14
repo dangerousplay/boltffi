@@ -368,6 +368,7 @@ Desktop JVM target configuration.
 - `host_targets` (array of strings, optional): Desired desktop native outputs.
   - Supported canonical values: `current`, `darwin-arm64`, `darwin-x86_64`, `linux-x86_64`, `linux-aarch64`, `windows-x86_64`
   - Supported aliases: `darwin-aarch64`, `darwin-x86-64`, `linux-x86-64`, `linux-arm64`, `windows-x86-64`
+  - Linux hosts (and `current` on a Linux machine) accept a glibc version suffix `.<major>.<minor>`, e.g. `linux-x86_64.2.17`. The build command then receives `--target x86_64-unknown-linux-gnu.2.17`; artifacts are still read from `target/x86_64-unknown-linux-gnu/` and written to `native/linux-x86_64/`. Requires a build command that understands the suffix (`[cargo].build_command = "zigbuild"` or a custom command); `cargo` and `cross` reject it. A host may appear only once, with or without a suffix.
   - Default: `["current"]`
 - `strip_symbols` (bool): Strip symbol tables from packaged desktop JNI libraries for custom named Cargo profiles used with `boltffi pack java`.
   - Default: `false`
