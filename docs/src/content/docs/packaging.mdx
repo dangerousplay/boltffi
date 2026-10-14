@@ -475,7 +475,18 @@ enabled = true
 host_targets = ["linux-x86_64.2.17"]
 ```
 
-The Rust library is built with `--target x86_64-unknown-linux-gnu.2.17`, so it only references glibc 2.17 symbols; the output still lands in `dist/java/native/linux-x86_64/`. The JNI library is linked by the JNI compiler (`clang`), which must target the same glibc version, for example through a `clang` wrapper that runs `zig cc -target x86_64-linux-gnu.2.17`. `cargo` and `cross` do not understand the suffix and are rejected.
+The Rust library is built with `--target x86_64-unknown-linux-gnu.2.17`, so it only references glibc 2.17 symbols; the output still lands in `dist/java/native/linux-x86_64/`. `cargo` and `cross` do not understand the suffix and are rejected.
+
+The JNI library must target the same glibc version. Set `jni_compiler = "zig cc"` and BoltFFI compiles and links it with `zig cc -target x86_64-linux-gnu.2.17`:
+
+```toml
+[targets.java.jvm]
+enabled = true
+host_targets = ["linux-x86_64.2.17"]
+jni_compiler = "zig cc"
+```
+
+With `jni_compiler` set, packaging `linux-x86_64` from macOS no longer needs a separate Linux cross linker: `zigbuild` links the Rust library and `zig cc` links the JNI library.
 
 Cross-host JNI compilation also needs target-appropriate JNI headers. If the active `JAVA_HOME` does not contain the target platform header directory, point BoltFFI at a target-specific JDK or header directory:
 

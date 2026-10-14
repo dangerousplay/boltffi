@@ -19,7 +19,7 @@ use crate::pack::symbols::{
 };
 use crate::reporter::Reporter;
 use crate::target::{GlibcVersion, JavaHostTarget, JavaJvmHostTarget};
-use crate::toolchain::NativeHostToolchain;
+use crate::toolchain::{JniCompilerOverride, NativeHostToolchain};
 
 use super::link::{
     JvmNativePackageLayout, build_jvm_native_library, compile_jni_library,
@@ -532,6 +532,12 @@ fn resolve_jvm_packaging_targets(
                 selected_library.cargo_manifest_path(),
                 host_target,
                 current_host,
+                config
+                    .java_jvm_jni_compiler()
+                    .map(|command| JniCompilerOverride {
+                        command,
+                        glibc_version: requested.glibc_version,
+                    }),
             )?;
             let cargo_context = JvmCargoContext {
                 host_target,

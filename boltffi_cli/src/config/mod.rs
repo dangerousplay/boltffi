@@ -890,6 +890,10 @@ impl Config {
         self.targets.java.jvm.debug_symbols.bundle
     }
 
+    pub fn java_jvm_jni_compiler(&self) -> Option<&targets::java::JniCompilerCommand> {
+        self.targets.java.jvm.jni_compiler.as_ref()
+    }
+
     pub fn java_jvm_requested_host_targets(&self) -> &[JavaJvmHostTarget] {
         self.targets
             .java
@@ -1907,6 +1911,40 @@ host_targets = ["linux-x86_64.2.17", "linux-aarch64.2.28"]
                 .collect::<Vec<_>>(),
             vec!["linux-x86_64.2.17", "linux-aarch64.2.28"]
         );
+    }
+
+    #[test]
+    fn parses_java_jvm_jni_compiler_and_rejects_empty_values() {
+        let config = parse_config(
+            r#"
+[package]
+name = "mylib"
+
+[targets.java.jvm]
+enabled = true
+jni_compiler = "zig cc"
+"#,
+        );
+        let jni_compiler = config.java_jvm_jni_compiler().expect("jni_compiler");
+        assert_eq!(jni_compiler.program(), "zig");
+        assert_eq!(jni_compiler.args(), ["cc"]);
+        assert!(
+            parse_config("[package]\nname = \"mylib\"\n")
+                .java_jvm_jni_compiler()
+                .is_none()
+        );
+
+        let error = toml::from_str::<Config>(
+            r#"
+[package]
+name = "mylib"
+
+[targets.java.jvm]
+jni_compiler = " "
+"#,
+        )
+        .expect_err("empty jni_compiler must be rejected");
+        assert!(error.to_string().contains("jni_compiler must not be empty"));
     }
 
     #[test]

@@ -370,6 +370,12 @@ Desktop JVM target configuration.
   - Supported aliases: `darwin-aarch64`, `darwin-x86-64`, `linux-x86-64`, `linux-arm64`, `windows-x86-64`
   - Linux hosts (and `current` on a Linux machine) accept a glibc version suffix `.<major>.<minor>`, e.g. `linux-x86_64.2.17`. The build command then receives `--target x86_64-unknown-linux-gnu.2.17`; artifacts are still read from `target/x86_64-unknown-linux-gnu/` and written to `native/linux-x86_64/`. Requires a build command that understands the suffix (`[cargo].build_command = "zigbuild"` or a custom command); `cargo` and `cross` reject it. A host may appear only once, with or without a suffix.
   - Default: `["current"]`
+- `jni_compiler` (string, optional): Program, plus leading arguments, that compiles the JNI glue and links the JNI library for every host target, e.g. `"zig cc"` or `"clang -fuse-ld=lld"`.
+  - Split on whitespace (no quoting), like `[cargo].build_command`; must not be empty or start with `-`. The program is looked up in `PATH` unless it contains a path separator.
+  - `zig cc` / `zig c++` receive `-target <zig-target>` derived from the Rust triple, including the glibc suffix of a host target: `linux-x86_64.2.17` → `-target x86_64-linux-gnu.2.17`, `linux-aarch64` → `aarch64-linux-gnu`, `darwin-arm64` → `aarch64-macos`, `windows-x86_64` (gnu) → `x86_64-windows-gnu`. Plain `zig` is rejected.
+  - Other programs get the target flags BoltFFI adds to the compiler it discovers (`--target <triple>` for clang drivers when cross-compiling, `-target`/`-isysroot` on macOS); MSVC drivers (`cl`, `clang-cl`) keep MSVC-style arguments.
+  - Takes precedence over `CARGO_TARGET_<TRIPLE>_LINKER`, cargo `target.<triple>.linker` and `BOLTFFI_JAVA_LINKER_<TRIPLE>` for the JNI library. Those values still configure the Rust linker; on macOS → `linux-x86_64` no separate cross linker is required when `jni_compiler` is set (the build command, e.g. `zigbuild`, links the Rust library).
+  - Default: unset (discover `clang` / the configured linker)
 - `strip_symbols` (bool): Strip symbol tables from packaged desktop JNI libraries for custom named Cargo profiles used with `boltffi pack java`.
   - Default: `false`
   - Currently supported for Darwin and Linux desktop JNI packaging only.

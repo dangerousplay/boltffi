@@ -142,6 +142,7 @@ mod tests {
                     Path::new("/tmp/workspace/Cargo.toml"),
                     current_host,
                     current_host,
+                    None,
                 )
                 .expect("native host toolchain"),
             }],

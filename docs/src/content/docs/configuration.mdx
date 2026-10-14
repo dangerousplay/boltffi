@@ -573,6 +573,15 @@ The default output is `dist/java`. This produces Java sources, a C header, JNI g
 
 Linux host targets accept a glibc version suffix, such as `linux-x86_64.2.17` or `linux-aarch64.2.28`, to set the oldest glibc the Rust library links against. BoltFFI passes `--target x86_64-unknown-linux-gnu.2.17` to the build command and still reads artifacts from the base triple directory and writes them to `native/linux-x86_64/`. Only [cargo-zigbuild](#build-command) understands the suffix, so it needs `build_command = "zigbuild"` (or a custom command that handles it); `cargo` and `cross` are rejected.
 
+`jni_compiler` replaces the C compiler that builds the JNI glue and links the JNI library for every host target. It is a program followed by leading arguments, split on whitespace:
+
+```toml
+[targets.java.jvm]
+jni_compiler = "zig cc"            # or "clang -fuse-ld=lld", "/opt/llvm/bin/clang"
+```
+
+For `zig cc` and `zig c++`, BoltFFI derives zig's `-target` from the Rust triple and the host target's glibc suffix, so `linux-x86_64.2.17` links with `-target x86_64-linux-gnu.2.17` and `darwin-arm64` with `-target aarch64-macos`. Other programs receive the same target flags as the compiler BoltFFI would have discovered. `jni_compiler` wins over `CARGO_TARGET_<TRIPLE>_LINKER`, cargo `target.<triple>.linker` and `BOLTFFI_JAVA_LINKER_<TRIPLE>` for the JNI library; those still configure the Rust linker.
+
 Phase 4 extends JVM packaging from current-host-only output to explicit desktop host matrices. Current-host packaging works on `darwin-arm64`, `darwin-x86_64`, `linux-x86_64`, `linux-aarch64`, and `windows-x86_64`. The initial cross-host parity path is macOS packaging `linux-x86_64`, which requires the Rust target, a configured Linux linker such as `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER` or `BOLTFFI_JAVA_LINKER_X86_64_UNKNOWN_LINUX_GNU`, and target-appropriate JNI headers via either `BOLTFFI_JAVA_HOME_X86_64_UNKNOWN_LINUX_GNU` or `BOLTFFI_JAVA_INCLUDE_X86_64_UNKNOWN_LINUX_GNU`. `pack java` rejects explicit Cargo `--target` passthrough args because the host matrix is controlled by `host_targets`.
 
 ### JVM Debug Symbols
