@@ -719,9 +719,7 @@ pub(crate) fn build_jvm_native_library(
         .command(operation, cargo_context.toolchain_selector.as_deref());
     command.current_dir(crate_directory);
 
-    command
-        .arg("--target")
-        .arg(&cargo_context.rust_target_triple);
+    command.arg("--target").arg(cargo_context.cargo_target());
     apply_jvm_cargo_package_selection(&mut command, cargo_context);
 
     if release {
@@ -1386,9 +1384,7 @@ pub(crate) fn query_native_link_metadata(
     let mut command = rustc_probe_command(cargo_context);
     command.current_dir(crate_directory);
 
-    command
-        .arg("--target")
-        .arg(&cargo_context.rust_target_triple);
+    command.arg("--target").arg(cargo_context.cargo_target());
     apply_jvm_cargo_package_selection(&mut command, cargo_context);
 
     if release {
@@ -1463,9 +1459,7 @@ fn query_library_filenames(
     let mut command = rustc_probe_command(cargo_context);
     command.current_dir(crate_directory);
 
-    command
-        .arg("--target")
-        .arg(&cargo_context.rust_target_triple);
+    command.arg("--target").arg(cargo_context.cargo_target());
     apply_jvm_cargo_package_selection(&mut command, cargo_context);
 
     if cargo_context.release {
@@ -1573,6 +1567,7 @@ mod tests {
             cargo_command_args: LibraryCargoArgs::default(),
             toolchain_selector: None,
             build_command: CargoBuildCommand::Cargo,
+            glibc_version: None,
         }
     }
 
@@ -2254,6 +2249,25 @@ mod tests {
     fn allows_automatic_windows_release_behavior_without_strip_opt_in() {
         validate_desktop_jni_symbol_stripping(&config(false), JavaHostTarget::WindowsX86_64)
             .expect("windows release packaging should remain unchanged without explicit opt-in");
+    }
+
+    #[test]
+    fn glibc_version_changes_the_cargo_target_but_not_the_artifact_directory() {
+        let root = temporary_directory("boltffi-glibc-target");
+        let mut cargo_context = cargo_context(&root, JavaHostTarget::LinuxX86_64);
+        cargo_context.glibc_version = Some("2.17".parse().unwrap());
+
+        assert_eq!(
+            cargo_context.cargo_target(),
+            "x86_64-unknown-linux-gnu.2.17"
+        );
+        assert_eq!(
+            cargo_context.artifact_directory(),
+            root.join("target/x86_64-unknown-linux-gnu/debug")
+        );
+
+        cargo_context.glibc_version = None;
+        assert_eq!(cargo_context.cargo_target(), "x86_64-unknown-linux-gnu");
     }
 
     #[test]

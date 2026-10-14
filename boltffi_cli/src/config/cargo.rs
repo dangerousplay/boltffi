@@ -51,6 +51,13 @@ impl CargoBuildCommand {
         matches!(self, Self::Cargo)
     }
 
+    /// Whether the program understands a `<triple>.<glibc>` target such as
+    /// `x86_64-unknown-linux-gnu.2.17`. `cargo` and `cross` do not; a custom
+    /// program is trusted to.
+    pub fn accepts_glibc_target_suffix(&self) -> bool {
+        !matches!(self, Self::Cargo | Self::Cross)
+    }
+
     pub fn program(&self) -> &str {
         match self {
             Self::Cargo => "cargo",

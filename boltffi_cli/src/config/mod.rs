@@ -6,7 +6,9 @@ use boltffi_bindgen::target::Target;
 use serde::{Deserialize, Serialize};
 
 use crate::cargo::{Cargo, CargoMetadataPackage};
-use crate::target::{Architecture, CSharpRuntimeIdentifier, JavaHostTarget, Platform, RustTarget};
+use crate::target::{
+    Architecture, CSharpRuntimeIdentifier, JavaHostTarget, JavaJvmHostTarget, Platform, RustTarget,
+};
 
 pub mod cargo;
 pub mod experimental;
@@ -880,17 +882,25 @@ impl Config {
         self.targets.java.jvm.debug_symbols.bundle
     }
 
-    pub fn java_jvm_requested_host_targets(&self) -> &[JavaHostTarget] {
+    pub fn java_jvm_requested_host_targets(&self) -> &[JavaJvmHostTarget] {
         self.targets
             .java
             .jvm
             .host_targets
             .as_deref()
-            .unwrap_or(JavaHostTarget::DEFAULTS)
+            .unwrap_or(JavaJvmHostTarget::DEFAULTS)
+    }
+
+    /// Resolved JVM host targets, including any glibc version suffix.
+    pub fn java_jvm_host_target_requests(
+        &self,
+    ) -> std::result::Result<Vec<JavaJvmHostTarget>, String> {
+        JavaJvmHostTarget::resolve_requested(self.java_jvm_requested_host_targets())
     }
 
     pub fn java_jvm_host_targets(&self) -> std::result::Result<Vec<JavaHostTarget>, String> {
-        JavaHostTarget::resolve_requested(self.java_jvm_requested_host_targets())
+        self.java_jvm_host_target_requests()
+            .map(|targets| targets.into_iter().map(|target| target.host).collect())
     }
 
     pub fn java_android_output(&self) -> PathBuf {
@@ -1703,7 +1713,7 @@ enabled = true
             config
                 .java_jvm_requested_host_targets()
                 .iter()
-                .map(|target| target.canonical_name())
+                .map(|target| target.host.canonical_name())
                 .collect::<Vec<_>>(),
             vec!["current"]
         );
@@ -1736,7 +1746,7 @@ host_targets = ["linux-x86_64"]
             config
                 .java_jvm_requested_host_targets()
                 .iter()
-                .map(|target| target.canonical_name())
+                .map(|target| target.host.canonical_name())
                 .collect::<Vec<_>>(),
             vec!["linux-x86_64"]
         );
@@ -1841,9 +1851,39 @@ host_targets = ["current", "darwin-aarch64", "linux-x86-64", "windows-x86-64"]
             config
                 .java_jvm_requested_host_targets()
                 .iter()
-                .map(|target| target.canonical_name())
+                .map(|target| target.host.canonical_name())
                 .collect::<Vec<_>>(),
             vec!["current", "darwin-arm64", "linux-x86_64", "windows-x86_64"]
+        );
+    }
+
+    #[test]
+    fn java_jvm_host_targets_keep_the_base_host_for_glibc_suffixed_entries() {
+        let config = parse_config(
+            r#"
+[package]
+name = "mylib"
+
+[targets.java.jvm]
+enabled = true
+host_targets = ["linux-x86_64.2.17", "linux-aarch64.2.28"]
+"#,
+        );
+
+        assert_eq!(
+            config
+                .java_jvm_host_targets()
+                .expect("resolved host targets"),
+            vec![JavaHostTarget::LinuxX86_64, JavaHostTarget::LinuxAarch64]
+        );
+        assert_eq!(
+            config
+                .java_jvm_host_target_requests()
+                .expect("resolved host targets")
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            vec!["linux-x86_64.2.17", "linux-aarch64.2.28"]
         );
     }
 
@@ -2314,7 +2354,7 @@ host_targets = ["linux-x86_64"]
             config
                 .java_jvm_requested_host_targets()
                 .iter()
-                .map(|target| target.canonical_name())
+                .map(|target| target.host.canonical_name())
                 .collect::<Vec<_>>(),
             vec!["linux-x86_64"]
         );

@@ -18,7 +18,7 @@ use crate::pack::symbols::{
     write_debug_symbols_zip,
 };
 use crate::reporter::Reporter;
-use crate::target::JavaHostTarget;
+use crate::target::{GlibcVersion, JavaHostTarget, JavaJvmHostTarget};
 use crate::toolchain::NativeHostToolchain;
 
 use super::link::{
@@ -41,6 +41,7 @@ pub(crate) struct JvmCargoContext {
     pub(crate) cargo_command_args: LibraryCargoArgs,
     pub(crate) toolchain_selector: Option<String>,
     pub(crate) build_command: CargoBuildCommand,
+    pub(crate) glibc_version: Option<GlibcVersion>,
 }
 
 pub(crate) struct JvmPackagingTarget {
@@ -65,6 +66,13 @@ impl JvmCargoContext {
             .join(&self.rust_target_triple)
             .join(self.build_profile.output_directory_name())
     }
+
+    /// The `--target` passed to the build command: the Rust triple, plus the
+    /// glibc version when one was requested. Outputs still land under the base
+    /// triple, see [`Self::artifact_directory`].
+    pub(crate) fn cargo_target(&self) -> String {
+        JavaJvmHostTarget::cargo_target(self.glibc_version, &self.rust_target_triple)
+    }
 }
 
 impl JvmPackagingTarget {
@@ -78,7 +86,7 @@ impl JvmPackagingTarget {
             .chain(cargo_context.cargo_command_args.iter().cloned());
         let generation = expansion
             .generation()
-            .triple(cargo_context.rust_target_triple.clone())
+            .triple(cargo_context.cargo_target())
             .cargo_args(cargo_args)
             .cargo_environment(self.toolchain.cargo_environment())
             .cargo_toolchain_selector(cargo_context.toolchain_selector.clone());
@@ -86,7 +94,7 @@ impl JvmPackagingTarget {
             format!(
                 "{} [{}]",
                 cargo_context.host_target.canonical_name(),
-                cargo_context.rust_target_triple
+                cargo_context.cargo_target()
             ),
             generation,
         )
@@ -325,7 +333,7 @@ fn prepare_jvm_packaging_matrix(
     )?;
 
     Ok(PreparedJvmPackaging {
-        host_targets,
+        host_targets: host_targets.iter().map(|target| target.host).collect(),
         packaging_targets,
     })
 }
@@ -466,9 +474,9 @@ fn write_jvm_debug_symbols(
     Ok(())
 }
 
-fn resolve_java_host_targets_for_packaging(config: &Config) -> Result<Vec<JavaHostTarget>> {
+fn resolve_java_host_targets_for_packaging(config: &Config) -> Result<Vec<JavaJvmHostTarget>> {
     config
-        .java_jvm_host_targets()
+        .java_jvm_host_target_requests()
         .map_err(|message| CliError::CommandFailed {
             command: message,
             status: None,
@@ -480,10 +488,11 @@ fn resolve_jvm_packaging_targets(
     build_cargo_args: &[String],
     release: bool,
     build_profile: CargoBuildProfile,
-    host_targets: &[JavaHostTarget],
+    host_targets: &[JavaJvmHostTarget],
     strip_symbols: bool,
     binding_expansion: Option<&BindingExpansion>,
 ) -> Result<Vec<JvmPackagingTarget>> {
+    ensure_glibc_host_targets_supported(&config.cargo.build_command, host_targets)?;
     let current_host = JavaHostTarget::current().ok_or_else(|| CliError::CommandFailed {
         command:
             "JVM packaging is only supported on darwin-arm64, darwin-x86_64, linux-x86_64, linux-aarch64, and windows-x86_64 hosts".to_string(),
@@ -514,7 +523,8 @@ fn resolve_jvm_packaging_targets(
     host_targets
         .iter()
         .copied()
-        .map(|host_target| {
+        .map(|requested| {
+            let host_target = requested.host;
             validate_desktop_jni_symbol_stripping_for(strip_symbols, host_target)?;
             let toolchain = NativeHostToolchain::discover(
                 toolchain_selector.as_deref(),
@@ -533,6 +543,7 @@ fn resolve_jvm_packaging_targets(
                 cargo_command_args: cargo_command_args.clone(),
                 toolchain_selector: toolchain_selector.clone(),
                 build_command: config.cargo.build_command.clone(),
+                glibc_version: requested.glibc_version,
             };
             let _ = resolve_jni_include_directories(&cargo_context)?;
             Ok(JvmPackagingTarget {
@@ -543,6 +554,28 @@ fn resolve_jvm_packaging_targets(
         .collect()
 }
 
+/// `cargo` and `cross` treat `x86_64-unknown-linux-gnu.2.17` as an unknown
+/// target, so a glibc version needs a build command such as `zigbuild`.
+fn ensure_glibc_host_targets_supported(
+    build_command: &CargoBuildCommand,
+    host_targets: &[JavaJvmHostTarget],
+) -> Result<()> {
+    match host_targets
+        .iter()
+        .find(|target| target.glibc_version.is_some())
+    {
+        Some(target) if !build_command.accepts_glibc_target_suffix() => {
+            Err(CliError::CommandFailed {
+                command: format!(
+                    "host target '{target}' sets a glibc version, which build command '{build_command}' does not support; use [cargo].build_command = \"zigbuild\" or --cargo-build-cmd zigbuild"
+                ),
+                status: None,
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -550,15 +583,15 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        ensure_java_ir_regeneration, ensure_java_no_build_supported,
-        ensure_jvm_pack_cargo_args_supported, resolve_jvm_packaging_targets,
-        write_jvm_debug_symbols,
+        ensure_glibc_host_targets_supported, ensure_java_ir_regeneration,
+        ensure_java_no_build_supported, ensure_jvm_pack_cargo_args_supported,
+        resolve_jvm_packaging_targets, write_jvm_debug_symbols,
     };
     use crate::build::CargoBuildProfile;
     use crate::cli::CliError;
-    use crate::config::{CargoConfig, Config, PackageConfig, TargetsConfig};
+    use crate::config::{CargoBuildCommand, CargoConfig, Config, PackageConfig, TargetsConfig};
     use crate::pack::java::link::JvmPackagedNativeOutput;
-    use crate::target::JavaHostTarget;
+    use crate::target::{JavaHostTarget, JavaJvmHostTarget};
     use boltffi_bindgen::cargo::LibraryCargoArgsError;
 
     fn temporary_directory(prefix: &str) -> PathBuf {
@@ -600,9 +633,54 @@ mod tests {
         strip_symbols: bool,
     ) -> Config {
         let mut config = config(java_enabled);
-        config.targets.java.jvm.host_targets = Some(host_targets);
+        config.targets.java.jvm.host_targets =
+            Some(host_targets.into_iter().map(Into::into).collect());
         config.targets.java.jvm.strip_symbols = strip_symbols;
         config
+    }
+
+    #[test]
+    fn glibc_host_targets_need_a_build_command_that_understands_them() {
+        let glibc_target = "linux-x86_64.2.17".parse::<JavaJvmHostTarget>().unwrap();
+        let plain_target = JavaJvmHostTarget::from(JavaHostTarget::LinuxX86_64);
+
+        for build_command in [CargoBuildCommand::Cargo, CargoBuildCommand::Cross] {
+            let error = ensure_glibc_host_targets_supported(&build_command, &[glibc_target])
+                .expect_err("glibc suffix needs zigbuild");
+            assert!(matches!(
+                error,
+                CliError::CommandFailed { command, status: None }
+                    if command.contains("'linux-x86_64.2.17' sets a glibc version")
+                        && command.contains(&format!("'{build_command}'"))
+                        && command.contains("zigbuild")
+            ));
+            ensure_glibc_host_targets_supported(&build_command, &[plain_target])
+                .expect("plain host targets work with every build command");
+        }
+        for build_command in [
+            CargoBuildCommand::Zigbuild,
+            "my-zig-wrapper rustc".parse().unwrap(),
+        ] {
+            ensure_glibc_host_targets_supported(&build_command, &[plain_target, glibc_target])
+                .expect("zigbuild and custom commands accept a glibc suffix");
+        }
+
+        let error = match resolve_jvm_packaging_targets(
+            &config(true),
+            &[],
+            false,
+            CargoBuildProfile::Debug,
+            &[glibc_target],
+            false,
+            None,
+        ) {
+            Ok(_) => panic!("plain cargo must reject a glibc suffix before probing"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            CliError::CommandFailed { command, .. } if command.contains("sets a glibc version")
+        ));
     }
 
     #[test]
@@ -649,7 +727,7 @@ mod tests {
             &["--workspace".to_string()],
             false,
             CargoBuildProfile::Debug,
-            &[current_host],
+            &[current_host.into()],
             false,
             None,
         ) {
@@ -709,7 +787,7 @@ mod tests {
             &[],
             false,
             CargoBuildProfile::Named("dist".to_string()),
-            &[JavaHostTarget::WindowsX86_64],
+            &[JavaHostTarget::WindowsX86_64.into()],
             true,
             None,
         ) {
