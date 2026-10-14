@@ -494,6 +494,10 @@ pub(crate) fn compile_jni_library_with_layout(
 
     if step.is_verbose() {
         print_verbose_detail(&format!(
+            "JNI compiler: {}",
+            packaging_target.toolchain.jni_compiler_display()
+        ));
+        print_verbose_detail(&format!(
             "JNI rustflag linker args: {:?}",
             packaging_target.toolchain.jni_rustflag_linker_args()
         ));

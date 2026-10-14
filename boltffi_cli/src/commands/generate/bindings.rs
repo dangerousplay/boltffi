@@ -257,6 +257,7 @@ fn resolve_java_generations(
                 expansion.cargo_args().as_slice(),
                 expansion.selected_library().cargo_manifest_path(),
                 &targets,
+                config.java_jvm_jni_compiler(),
             )?
             .into_iter()
             .map(|(target, toolchain)| {
