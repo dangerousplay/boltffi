@@ -1405,12 +1405,31 @@ pub(crate) fn query_native_link_metadata(
 
     if !output.status.success() {
         return Err(CliError::CommandFailed {
-            command: "cargo rustc --print=native-static-libs".to_string(),
+            command: failed_probe_description(
+                "cargo rustc --print=native-static-libs",
+                &String::from_utf8_lossy(&output.stderr),
+            ),
             status: output.status.code(),
         });
     }
 
     NativeLinkMetadata::from_output(&output)
+}
+
+const PROBE_STDERR_TAIL_LINES: usize = 25;
+
+/// Describes a failed cargo probe with the tail of its stderr, so a missing
+/// cross C toolchain or linker error is visible instead of a bare exit code.
+fn failed_probe_description(probe: &str, stderr: &str) -> String {
+    let lines = stderr
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        return probe.to_string();
+    }
+    let tail = &lines[lines.len().saturating_sub(PROBE_STDERR_TAIL_LINES)..];
+    format!("{probe}:\n{}", tail.join("\n"))
 }
 
 fn resolve_static_library_filename(cargo_context: &JvmCargoContext) -> Result<Option<String>> {
@@ -1469,7 +1488,10 @@ fn query_library_filenames(cargo_context: &JvmCargoContext) -> Result<Vec<String
 
     if !output.status.success() {
         return Err(CliError::CommandFailed {
-            command: "cargo rustc --print=file-names".to_string(),
+            command: failed_probe_description(
+                "cargo rustc --print=file-names",
+                &String::from_utf8_lossy(&output.stderr),
+            ),
             status: output.status.code(),
         });
     }
@@ -1510,19 +1532,20 @@ mod tests {
 
     use super::{
         DesktopJniStripMode, JniIncludeDirectories, JniLinkerArgs, JvmNativeLinkInput,
-        JvmNativePackageLayout, apple_dsym_bundle_path, apply_jvm_cargo_package_selection,
-        bundled_jvm_shared_library_path, clang_native_static_library_flags,
-        clang_release_optimization_flags, clang_style_jni_linker_args,
-        clang_undefined_symbol_policy_flags, compiler_tool_version_suffix, desktop_jni_strip_mode,
-        existing_jvm_shared_library_path, extract_library_filenames,
-        handle_missing_linux_strip_program, link_search_path_flags, linux_strip_program_candidates,
-        msvc_link_search_path_flags, msvc_native_static_library_flags, msvc_rustflag_linker_args,
-        msvc_style_jni_linker_args, resolve_jni_include_directories_with_overrides,
-        resolve_jvm_native_link_input, resolve_linux_strip_program,
-        select_windows_static_library_filename, should_generate_apple_dsym_sidecars,
-        target_prefixed_binutils_prefix, target_prefixed_strip_tool_candidates,
-        target_specific_java_home_env_key, target_specific_java_include_env_key,
-        validate_desktop_jni_symbol_stripping, vendorless_linux_target_triple,
+        JvmNativePackageLayout, PROBE_STDERR_TAIL_LINES, apple_dsym_bundle_path,
+        apply_jvm_cargo_package_selection, bundled_jvm_shared_library_path,
+        clang_native_static_library_flags, clang_release_optimization_flags,
+        clang_style_jni_linker_args, clang_undefined_symbol_policy_flags,
+        compiler_tool_version_suffix, desktop_jni_strip_mode, existing_jvm_shared_library_path,
+        extract_library_filenames, failed_probe_description, handle_missing_linux_strip_program,
+        link_search_path_flags, linux_strip_program_candidates, msvc_link_search_path_flags,
+        msvc_native_static_library_flags, msvc_rustflag_linker_args, msvc_style_jni_linker_args,
+        resolve_jni_include_directories_with_overrides, resolve_jvm_native_link_input,
+        resolve_linux_strip_program, select_windows_static_library_filename,
+        should_generate_apple_dsym_sidecars, target_prefixed_binutils_prefix,
+        target_prefixed_strip_tool_candidates, target_specific_java_home_env_key,
+        target_specific_java_include_env_key, validate_desktop_jni_symbol_stripping,
+        vendorless_linux_target_triple,
     };
     use boltffi_bindgen::cargo::LibraryCargoArgs;
 
@@ -1602,6 +1625,31 @@ mod tests {
                 "-p",
                 cargo_context.library.package_id(),
             ]
+        );
+    }
+
+    #[test]
+    fn failed_probe_description_keeps_only_the_stderr_tail() {
+        let stderr = (1..=40)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let description = failed_probe_description("cargo rustc --print=file-names", &stderr);
+
+        let mut lines = description.lines();
+        assert_eq!(lines.next(), Some("cargo rustc --print=file-names:"));
+        let tail = lines.collect::<Vec<_>>();
+        assert_eq!(tail.len(), PROBE_STDERR_TAIL_LINES);
+        assert_eq!(tail.first(), Some(&"line 16"));
+        assert_eq!(tail.last(), Some(&"line 40"));
+    }
+
+    #[test]
+    fn failed_probe_description_without_stderr_names_only_the_probe() {
+        assert_eq!(
+            failed_probe_description("cargo rustc --print=native-static-libs", "\n  \n"),
+            "cargo rustc --print=native-static-libs"
         );
     }
 
