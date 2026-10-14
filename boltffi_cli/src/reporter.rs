@@ -110,4 +110,44 @@ impl Step {
             println!("   {} {}", style("✓").green(), message);
         }
     }
+
+    pub fn finish_failure(self, reason: &str) {
+        if let Some(pb) = self.spinner {
+            pb.finish_and_clear();
+        }
+        if self.verbosity != Verbosity::Quiet {
+            println!(
+                "   {} {}",
+                style("✗").red(),
+                style(failure_line(&self.message, reason)).red()
+            );
+        }
+    }
+}
+
+fn failure_line(message: &str, reason: &str) -> String {
+    format!("{message} failed: {reason}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Reporter, Verbosity, failure_line};
+
+    #[test]
+    fn failure_line_names_step_and_reason() {
+        assert_eq!(
+            failure_line(
+                "Building Rust library for linux-aarch64",
+                "linker not found"
+            ),
+            "Building Rust library for linux-aarch64 failed: linker not found"
+        );
+    }
+
+    #[test]
+    fn quiet_step_can_finish_with_failure() {
+        Reporter::new(Verbosity::Quiet)
+            .step("Compiling JNI library for linux-x86_64")
+            .finish_failure("cc exited with status 1");
+    }
 }
