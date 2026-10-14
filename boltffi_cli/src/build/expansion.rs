@@ -2,10 +2,11 @@ use std::path::PathBuf;
 
 use boltffi_bindgen::cargo::LibraryCargoArgs;
 use boltffi_bindgen::generate::Generation;
+use boltffi_bindgen::metadata::CargoRustcCommand;
 
 use crate::cargo::{Cargo, CargoMetadata, SelectedLibrary};
 use crate::cli::Result;
-use crate::config::Config;
+use crate::config::{CargoBuildCommand, CargoOperation, Config};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BindingExpansion {
@@ -13,6 +14,7 @@ pub struct BindingExpansion {
     target_directory: PathBuf,
     cargo_args: LibraryCargoArgs,
     toolchain_selector: Option<String>,
+    build_command: CargoBuildCommand,
 }
 
 impl BindingExpansion {
@@ -82,10 +84,22 @@ impl BindingExpansion {
         &self.library
     }
 
+    /// The metadata build runs through the same build command as the library
+    /// build, so a cross target compiles with the toolchain it is packaged with.
     pub fn generation(&self) -> Generation {
+        let rustc_command = (!self.build_command.is_default()).then(|| {
+            CargoRustcCommand::new(
+                self.build_command.program(),
+                self.build_command
+                    .subcommand(CargoOperation::Rustc)
+                    .into_iter()
+                    .map(str::to_owned),
+            )
+        });
         Generation::new(self.manifest_path())
             .cargo_args(self.cargo_args.iter().cloned())
             .cargo_toolchain_selector(self.toolchain_selector().map(str::to_owned))
+            .cargo_rustc_command(rustc_command)
     }
 
     fn from_metadata(
@@ -126,6 +140,7 @@ impl BindingExpansion {
             target_directory: metadata.target_directory.clone(),
             cargo_args,
             toolchain_selector: cargo.toolchain_selector().map(str::to_owned),
+            build_command: config.cargo.build_command.clone(),
         })
     }
 }
@@ -143,6 +158,7 @@ impl BindingExpansion {
             target_directory: PathBuf::from("/external/workspace/target"),
             cargo_args: LibraryCargoArgs::parse(cargo_args).unwrap(),
             toolchain_selector: Some("+nightly".to_string()),
+            build_command: CargoBuildCommand::Cargo,
         }
     }
 
@@ -162,7 +178,7 @@ mod tests {
     use crate::cargo::fixture::{CargoMetadataFixture, CargoPackageFixture, CargoTargetFixture};
     use crate::cargo::{Cargo, CargoCrateType, SelectedLibrary};
     use crate::cli::CliError;
-    use crate::config::{CargoConfig, Config, PackageConfig, TargetsConfig};
+    use crate::config::{CargoBuildCommand, CargoConfig, Config, PackageConfig, TargetsConfig};
 
     fn expansion() -> BindingExpansion {
         let crate_root = std::env::temp_dir().join("boltffi-expansion-test");
@@ -176,6 +192,7 @@ mod tests {
             cargo_args: LibraryCargoArgs::parse(["--features".to_string(), "ffi".to_string()])
                 .unwrap(),
             toolchain_selector: Some("+nightly".to_string()),
+            build_command: CargoBuildCommand::Cargo,
         }
     }
 
