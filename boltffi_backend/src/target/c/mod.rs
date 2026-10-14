@@ -596,7 +596,7 @@ mod tests {
         assert!(header.contains("#if defined(_MSC_VER)\n#include <intrin.h>"));
         assert!(
             header.contains(
-                "#elif defined(__cplusplus) && (defined(__clang__) || defined(__GNUC__))"
+                "#elif (defined(__cplusplus) && (defined(__clang__) || defined(__GNUC__))) || defined(BOLTFFI_C_ATOMIC_BUILTINS)"
             )
         );
         assert!(!header.contains("#if defined(__cplusplus) && defined(_MSC_VER)"));
@@ -770,6 +770,33 @@ mod tests {
         assert!(
             out.status.success(),
             "cc failed:\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // Pre-C11 dialects have no <stdatomic.h>; the header must fall back to
+        // the GCC/Clang __atomic builtins instead of failing to include it.
+        std::fs::write(
+            dir.join("demo_c99.c"),
+            "\n#include \"boltffi.h\"\n#ifndef BOLTFFI_C_ATOMIC_BUILTINS\n#error \"expected the __atomic builtin fallback\"\n#endif\nint main(void) {\n    uint8_t state = 0;\n    uint64_t slot = 0;\n    (void)boltffi_atomic_u8_cas(&state, 0, 1);\n    (void)boltffi_atomic_u64_exchange(&slot, 2);\n    (void)boltffi_atomic_u64_cas(&slot, 2, 3);\n    (void)boltffi_atomic_u64_load(&slot);\n    return demo_add(1, 2) == 3 ? 0 : 1;\n}\n",
+        )
+        .expect("write C99 source");
+        let out = Command::new("cc")
+            .current_dir(&dir)
+            .args([
+                "-std=c99",
+                "-pedantic-errors",
+                "-Werror",
+                "-c",
+                "demo_c99.c",
+                "-o",
+                "demo_c99.o",
+            ])
+            .output()
+            .expect("cc runs");
+        assert!(
+            out.status.success(),
+            "cc -std=c99 failed:\n{}\n{}",
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
