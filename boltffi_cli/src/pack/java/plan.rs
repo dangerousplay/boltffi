@@ -18,7 +18,7 @@ use crate::pack::symbols::{
     write_debug_symbols_zip,
 };
 use crate::reporter::Reporter;
-use crate::target::{GlibcVersion, JavaHostTarget, JavaJvmHostTarget};
+use crate::target::{GlibcVersion, JavaHostTarget, JavaJvmHostTarget, NativeHostPlatform};
 use crate::toolchain::{JniCompilerOverride, NativeHostToolchain};
 
 use super::link::{
@@ -539,6 +539,13 @@ fn resolve_jvm_packaging_targets(
                         glibc_version: requested.glibc_version,
                     }),
             )?;
+            ensure_foreign_linux_target_linkable(
+                &config.cargo.build_command,
+                host_target,
+                current_host,
+                toolchain.rust_target_triple(),
+                toolchain.cargo_environment().next().is_some(),
+            )?;
             let cargo_context = JvmCargoContext {
                 host_target,
                 rust_target_triple: toolchain.rust_target_triple().to_string(),
@@ -582,6 +589,36 @@ fn ensure_glibc_host_targets_supported(
     }
 }
 
+/// Plain `cargo` links a foreign Linux target with the host `cc`, which fails
+/// late with a confusing linker error. `zigbuild`, `cross` and custom build
+/// commands bring their own linker; plain cargo needs a configured or
+/// discovered cross linker (`CARGO_TARGET_<T>_LINKER`).
+fn ensure_foreign_linux_target_linkable(
+    build_command: &CargoBuildCommand,
+    host_target: JavaHostTarget,
+    current_host: JavaHostTarget,
+    rust_target_triple: &str,
+    has_cargo_linker: bool,
+) -> Result<()> {
+    let target = host_target.native_host_platform();
+    let foreign_linux = matches!(
+        target,
+        NativeHostPlatform::LinuxX86_64 | NativeHostPlatform::LinuxAarch64
+    ) && target != current_host.native_host_platform();
+    if !foreign_linux || !build_command.is_default() || has_cargo_linker {
+        return Ok(());
+    }
+    let triple = rust_target_triple;
+    Err(CliError::CommandFailed {
+        command: format!(
+            "host target '{}' needs a cross linker for '{triple}' when building with plain cargo; use [cargo].build_command = \"zigbuild\" (or --cargo-build-cmd zigbuild), or set CARGO_TARGET_{}_LINKER / cargo target.{triple}.linker",
+            host_target.canonical_name(),
+            triple.replace('-', "_").to_uppercase(),
+        ),
+        status: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -589,9 +626,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        ensure_glibc_host_targets_supported, ensure_java_ir_regeneration,
-        ensure_java_no_build_supported, ensure_jvm_pack_cargo_args_supported,
-        resolve_jvm_packaging_targets, write_jvm_debug_symbols,
+        ensure_foreign_linux_target_linkable, ensure_glibc_host_targets_supported,
+        ensure_java_ir_regeneration, ensure_java_no_build_supported,
+        ensure_jvm_pack_cargo_args_supported, resolve_jvm_packaging_targets,
+        write_jvm_debug_symbols,
     };
     use crate::build::CargoBuildProfile;
     use crate::cli::CliError;
@@ -687,6 +725,70 @@ mod tests {
             error,
             CliError::CommandFailed { command, .. } if command.contains("sets a glibc version")
         ));
+    }
+
+    #[test]
+    fn plain_cargo_needs_a_cross_linker_for_a_foreign_linux_target() {
+        let aarch64 = "aarch64-unknown-linux-gnu";
+        let check = |build_command: &CargoBuildCommand, target, current, has_linker| {
+            ensure_foreign_linux_target_linkable(
+                build_command,
+                target,
+                current,
+                aarch64,
+                has_linker,
+            )
+        };
+
+        let error = check(
+            &CargoBuildCommand::Cargo,
+            JavaHostTarget::LinuxAarch64,
+            JavaHostTarget::LinuxX86_64,
+            false,
+        )
+        .expect_err("plain cargo cannot link a foreign linux target with the host cc");
+        assert!(matches!(
+            error,
+            CliError::CommandFailed { command, status: None }
+                if command.contains("'linux-aarch64' needs a cross linker")
+                    && command.contains("zigbuild")
+                    && command.contains("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER")
+        ));
+
+        check(
+            &CargoBuildCommand::Cargo,
+            JavaHostTarget::LinuxAarch64,
+            JavaHostTarget::LinuxX86_64,
+            true,
+        )
+        .expect("a configured or discovered cross linker is enough for cargo");
+        for build_command in [
+            CargoBuildCommand::Zigbuild,
+            CargoBuildCommand::Cross,
+            "my-wrapper rustc".parse().unwrap(),
+        ] {
+            check(
+                &build_command,
+                JavaHostTarget::LinuxAarch64,
+                JavaHostTarget::LinuxX86_64,
+                false,
+            )
+            .expect("non-cargo build commands bring their own linker");
+        }
+        for (target, current) in [
+            (JavaHostTarget::LinuxX86_64, JavaHostTarget::LinuxX86_64),
+            (JavaHostTarget::DarwinX86_64, JavaHostTarget::DarwinArm64),
+        ] {
+            check(&CargoBuildCommand::Cargo, target, current, false)
+                .expect("same-platform and non-linux targets are untouched");
+        }
+        check(
+            &CargoBuildCommand::Cargo,
+            JavaHostTarget::LinuxX86_64,
+            JavaHostTarget::DarwinArm64,
+            false,
+        )
+        .expect_err("darwin to linux with plain cargo also needs a linker");
     }
 
     #[test]
