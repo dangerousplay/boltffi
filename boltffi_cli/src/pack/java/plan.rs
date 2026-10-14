@@ -9,15 +9,17 @@ use crate::cli::{CliError, Result};
 use crate::commands::generate::java::TargetGeneration;
 use crate::commands::generate::run_generate_java_with_generations;
 use crate::commands::pack::{PackExecutionOptions, PackJavaOptions};
-use crate::config::{Config, DebugSymbolsBundle, DebugSymbolsFormat, TargetSection};
+use crate::config::{
+    CargoBuildCommand, Config, DebugSymbolsBundle, DebugSymbolsFormat, TargetSection,
+};
 use crate::pack::resolve_build_cargo_args;
 use crate::pack::symbols::{
     DebugSymbolArtifact, DebugSymbolArtifactKind, ensure_debug_symbols_profile_has_debuginfo,
     write_debug_symbols_zip,
 };
 use crate::reporter::Reporter;
-use crate::target::JavaHostTarget;
-use crate::toolchain::NativeHostToolchain;
+use crate::target::{GlibcVersion, JavaHostTarget, JavaJvmHostTarget, NativeHostPlatform};
+use crate::toolchain::{JniCompilerOverride, NativeHostToolchain};
 
 use super::link::{
     JvmNativePackageLayout, build_jvm_native_library, compile_jni_library,
@@ -38,6 +40,8 @@ pub(crate) struct JvmCargoContext {
     pub(crate) target_directory: PathBuf,
     pub(crate) cargo_command_args: LibraryCargoArgs,
     pub(crate) toolchain_selector: Option<String>,
+    pub(crate) build_command: CargoBuildCommand,
+    pub(crate) glibc_version: Option<GlibcVersion>,
 }
 
 pub(crate) struct JvmPackagingTarget {
@@ -62,6 +66,13 @@ impl JvmCargoContext {
             .join(&self.rust_target_triple)
             .join(self.build_profile.output_directory_name())
     }
+
+    /// The `--target` passed to the build command: the Rust triple, plus the
+    /// glibc version when one was requested. Outputs still land under the base
+    /// triple, see [`Self::artifact_directory`].
+    pub(crate) fn cargo_target(&self) -> String {
+        JavaJvmHostTarget::cargo_target(self.glibc_version, &self.rust_target_triple)
+    }
 }
 
 impl JvmPackagingTarget {
@@ -75,7 +86,7 @@ impl JvmPackagingTarget {
             .chain(cargo_context.cargo_command_args.iter().cloned());
         let generation = expansion
             .generation()
-            .triple(cargo_context.rust_target_triple.clone())
+            .triple(cargo_context.cargo_target())
             .cargo_args(cargo_args)
             .cargo_environment(self.toolchain.cargo_environment())
             .cargo_toolchain_selector(cargo_context.toolchain_selector.clone());
@@ -83,7 +94,7 @@ impl JvmPackagingTarget {
             format!(
                 "{} [{}]",
                 cargo_context.host_target.canonical_name(),
-                cargo_context.rust_target_triple
+                cargo_context.cargo_target()
             ),
             generation,
         )
@@ -322,7 +333,7 @@ fn prepare_jvm_packaging_matrix(
     )?;
 
     Ok(PreparedJvmPackaging {
-        host_targets,
+        host_targets: host_targets.iter().map(|target| target.host).collect(),
         packaging_targets,
     })
 }
@@ -463,9 +474,9 @@ fn write_jvm_debug_symbols(
     Ok(())
 }
 
-fn resolve_java_host_targets_for_packaging(config: &Config) -> Result<Vec<JavaHostTarget>> {
+fn resolve_java_host_targets_for_packaging(config: &Config) -> Result<Vec<JavaJvmHostTarget>> {
     config
-        .java_jvm_host_targets()
+        .java_jvm_host_target_requests()
         .map_err(|message| CliError::CommandFailed {
             command: message,
             status: None,
@@ -477,10 +488,11 @@ fn resolve_jvm_packaging_targets(
     build_cargo_args: &[String],
     release: bool,
     build_profile: CargoBuildProfile,
-    host_targets: &[JavaHostTarget],
+    host_targets: &[JavaJvmHostTarget],
     strip_symbols: bool,
     binding_expansion: Option<&BindingExpansion>,
 ) -> Result<Vec<JvmPackagingTarget>> {
+    ensure_glibc_host_targets_supported(&config.cargo.build_command, host_targets)?;
     let current_host = JavaHostTarget::current().ok_or_else(|| CliError::CommandFailed {
         command:
             "JVM packaging is only supported on darwin-arm64, darwin-x86_64, linux-x86_64, linux-aarch64, and windows-x86_64 hosts".to_string(),
@@ -511,7 +523,8 @@ fn resolve_jvm_packaging_targets(
     host_targets
         .iter()
         .copied()
-        .map(|host_target| {
+        .map(|requested| {
+            let host_target = requested.host;
             validate_desktop_jni_symbol_stripping_for(strip_symbols, host_target)?;
             let toolchain = NativeHostToolchain::discover(
                 toolchain_selector.as_deref(),
@@ -519,6 +532,19 @@ fn resolve_jvm_packaging_targets(
                 selected_library.cargo_manifest_path(),
                 host_target,
                 current_host,
+                config
+                    .java_jvm_jni_compiler()
+                    .map(|command| JniCompilerOverride {
+                        command,
+                        glibc_version: requested.glibc_version,
+                    }),
+            )?;
+            ensure_foreign_linux_target_linkable(
+                &config.cargo.build_command,
+                host_target,
+                current_host,
+                toolchain.rust_target_triple(),
+                toolchain.cargo_environment().next().is_some(),
             )?;
             let cargo_context = JvmCargoContext {
                 host_target,
@@ -529,6 +555,8 @@ fn resolve_jvm_packaging_targets(
                 target_directory: metadata.target_directory.clone(),
                 cargo_command_args: cargo_command_args.clone(),
                 toolchain_selector: toolchain_selector.clone(),
+                build_command: config.cargo.build_command.clone(),
+                glibc_version: requested.glibc_version,
             };
             let _ = resolve_jni_include_directories(&cargo_context)?;
             Ok(JvmPackagingTarget {
@@ -539,6 +567,58 @@ fn resolve_jvm_packaging_targets(
         .collect()
 }
 
+/// `cargo` and `cross` treat `x86_64-unknown-linux-gnu.2.17` as an unknown
+/// target, so a glibc version needs a build command such as `zigbuild`.
+fn ensure_glibc_host_targets_supported(
+    build_command: &CargoBuildCommand,
+    host_targets: &[JavaJvmHostTarget],
+) -> Result<()> {
+    match host_targets
+        .iter()
+        .find(|target| target.glibc_version.is_some())
+    {
+        Some(target) if !build_command.accepts_glibc_target_suffix() => {
+            Err(CliError::CommandFailed {
+                command: format!(
+                    "host target '{target}' sets a glibc version, which build command '{build_command}' does not support; use [cargo].build_command = \"zigbuild\" or --cargo-build-cmd zigbuild"
+                ),
+                status: None,
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Plain `cargo` links a foreign Linux target with the host `cc`, which fails
+/// late with a confusing linker error. `zigbuild`, `cross` and custom build
+/// commands bring their own linker; plain cargo needs a configured or
+/// discovered cross linker (`CARGO_TARGET_<T>_LINKER`).
+fn ensure_foreign_linux_target_linkable(
+    build_command: &CargoBuildCommand,
+    host_target: JavaHostTarget,
+    current_host: JavaHostTarget,
+    rust_target_triple: &str,
+    has_cargo_linker: bool,
+) -> Result<()> {
+    let target = host_target.native_host_platform();
+    let foreign_linux = matches!(
+        target,
+        NativeHostPlatform::LinuxX86_64 | NativeHostPlatform::LinuxAarch64
+    ) && target != current_host.native_host_platform();
+    if !foreign_linux || !build_command.is_default() || has_cargo_linker {
+        return Ok(());
+    }
+    let triple = rust_target_triple;
+    Err(CliError::CommandFailed {
+        command: format!(
+            "host target '{}' needs a cross linker for '{triple}' when building with plain cargo; use [cargo].build_command = \"zigbuild\" (or --cargo-build-cmd zigbuild), or set CARGO_TARGET_{}_LINKER / cargo target.{triple}.linker",
+            host_target.canonical_name(),
+            triple.replace('-', "_").to_uppercase(),
+        ),
+        status: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -546,15 +626,16 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
+        ensure_foreign_linux_target_linkable, ensure_glibc_host_targets_supported,
         ensure_java_ir_regeneration, ensure_java_no_build_supported,
         ensure_jvm_pack_cargo_args_supported, resolve_jvm_packaging_targets,
         write_jvm_debug_symbols,
     };
     use crate::build::CargoBuildProfile;
     use crate::cli::CliError;
-    use crate::config::{CargoConfig, Config, PackageConfig, TargetsConfig};
+    use crate::config::{CargoBuildCommand, CargoConfig, Config, PackageConfig, TargetsConfig};
     use crate::pack::java::link::JvmPackagedNativeOutput;
-    use crate::target::JavaHostTarget;
+    use crate::target::{JavaHostTarget, JavaJvmHostTarget};
     use boltffi_bindgen::cargo::LibraryCargoArgsError;
 
     fn temporary_directory(prefix: &str) -> PathBuf {
@@ -596,9 +677,118 @@ mod tests {
         strip_symbols: bool,
     ) -> Config {
         let mut config = config(java_enabled);
-        config.targets.java.jvm.host_targets = Some(host_targets);
+        config.targets.java.jvm.host_targets =
+            Some(host_targets.into_iter().map(Into::into).collect());
         config.targets.java.jvm.strip_symbols = strip_symbols;
         config
+    }
+
+    #[test]
+    fn glibc_host_targets_need_a_build_command_that_understands_them() {
+        let glibc_target = "linux-x86_64.2.17".parse::<JavaJvmHostTarget>().unwrap();
+        let plain_target = JavaJvmHostTarget::from(JavaHostTarget::LinuxX86_64);
+
+        for build_command in [CargoBuildCommand::Cargo, CargoBuildCommand::Cross] {
+            let error = ensure_glibc_host_targets_supported(&build_command, &[glibc_target])
+                .expect_err("glibc suffix needs zigbuild");
+            assert!(matches!(
+                error,
+                CliError::CommandFailed { command, status: None }
+                    if command.contains("'linux-x86_64.2.17' sets a glibc version")
+                        && command.contains(&format!("'{build_command}'"))
+                        && command.contains("zigbuild")
+            ));
+            ensure_glibc_host_targets_supported(&build_command, &[plain_target])
+                .expect("plain host targets work with every build command");
+        }
+        for build_command in [
+            CargoBuildCommand::Zigbuild,
+            "my-zig-wrapper rustc".parse().unwrap(),
+        ] {
+            ensure_glibc_host_targets_supported(&build_command, &[plain_target, glibc_target])
+                .expect("zigbuild and custom commands accept a glibc suffix");
+        }
+
+        let error = match resolve_jvm_packaging_targets(
+            &config(true),
+            &[],
+            false,
+            CargoBuildProfile::Debug,
+            &[glibc_target],
+            false,
+            None,
+        ) {
+            Ok(_) => panic!("plain cargo must reject a glibc suffix before probing"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            CliError::CommandFailed { command, .. } if command.contains("sets a glibc version")
+        ));
+    }
+
+    #[test]
+    fn plain_cargo_needs_a_cross_linker_for_a_foreign_linux_target() {
+        let aarch64 = "aarch64-unknown-linux-gnu";
+        let check = |build_command: &CargoBuildCommand, target, current, has_linker| {
+            ensure_foreign_linux_target_linkable(
+                build_command,
+                target,
+                current,
+                aarch64,
+                has_linker,
+            )
+        };
+
+        let error = check(
+            &CargoBuildCommand::Cargo,
+            JavaHostTarget::LinuxAarch64,
+            JavaHostTarget::LinuxX86_64,
+            false,
+        )
+        .expect_err("plain cargo cannot link a foreign linux target with the host cc");
+        assert!(matches!(
+            error,
+            CliError::CommandFailed { command, status: None }
+                if command.contains("'linux-aarch64' needs a cross linker")
+                    && command.contains("zigbuild")
+                    && command.contains("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER")
+        ));
+
+        check(
+            &CargoBuildCommand::Cargo,
+            JavaHostTarget::LinuxAarch64,
+            JavaHostTarget::LinuxX86_64,
+            true,
+        )
+        .expect("a configured or discovered cross linker is enough for cargo");
+        for build_command in [
+            CargoBuildCommand::Zigbuild,
+            CargoBuildCommand::Cross,
+            "my-wrapper rustc".parse().unwrap(),
+        ] {
+            check(
+                &build_command,
+                JavaHostTarget::LinuxAarch64,
+                JavaHostTarget::LinuxX86_64,
+                false,
+            )
+            .expect("non-cargo build commands bring their own linker");
+        }
+        for (target, current) in [
+            (JavaHostTarget::LinuxX86_64, JavaHostTarget::LinuxX86_64),
+            (JavaHostTarget::DarwinX86_64, JavaHostTarget::DarwinArm64),
+        ] {
+            check(&CargoBuildCommand::Cargo, target, current, false)
+                .expect("same-platform and non-linux targets are untouched");
+        }
+        check(
+            &CargoBuildCommand::Cargo,
+            JavaHostTarget::LinuxX86_64,
+            JavaHostTarget::DarwinArm64,
+            false,
+        )
+        .expect_err("darwin to linux with plain cargo also needs a linker");
     }
 
     #[test]
@@ -645,7 +835,7 @@ mod tests {
             &["--workspace".to_string()],
             false,
             CargoBuildProfile::Debug,
-            &[current_host],
+            &[current_host.into()],
             false,
             None,
         ) {
@@ -705,7 +895,7 @@ mod tests {
             &[],
             false,
             CargoBuildProfile::Named("dist".to_string()),
-            &[JavaHostTarget::WindowsX86_64],
+            &[JavaHostTarget::WindowsX86_64.into()],
             true,
             None,
         ) {

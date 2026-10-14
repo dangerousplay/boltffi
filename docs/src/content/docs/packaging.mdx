@@ -450,10 +450,59 @@ host_targets = ["current", "linux-x86_64"]
 Current Phase 4 support is intentionally narrow:
 
 - Current-host packaging works on `darwin-arm64`, `darwin-x86_64`, `linux-x86_64`, `linux-aarch64`, and `windows-x86_64`
-- Cross-host packaging is supported for the initial parity set, including the macOS release case of `linux-x86_64`
+- Cross-host packaging is supported for the initial parity set, including the macOS release case of `linux-x86_64` and Linux packaging the other Linux architecture (`linux-x86_64` ↔ `linux-aarch64`)
 - Cross-host targets must be fully configured up front; BoltFFI fails early instead of silently skipping them
 
 For the macOS to Linux desktop case, install the Rust target and provide a Linux linker that Cargo can use, for example via `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER` or `BOLTFFI_JAVA_LINKER_X86_64_UNKNOWN_LINUX_GNU`.
+
+To run the JVM build, its link probes and the metadata build through `cargo-zigbuild` or `cross`, set `[cargo].build_command` or pass `--cargo-build-cmd` (see [Configuration](/docs/configuration#build-command)).
+
+To ship a Linux library that loads on older distributions, add a glibc version to the Linux host target and build through `cargo-zigbuild`:
+
+```toml
+[cargo]
+build_command = "zigbuild"
+
+[targets.java.jvm]
+enabled = true
+host_targets = ["linux-x86_64.2.17"]
+```
+
+The Rust library is built with `--target x86_64-unknown-linux-gnu.2.17`, so it only references glibc 2.17 symbols; the output still lands in `dist/java/native/linux-x86_64/`. `cargo` and `cross` do not understand the suffix and are rejected.
+
+The JNI library must target the same glibc version. Set `jni_compiler = "zig cc"` and BoltFFI compiles and links it with `zig cc -target x86_64-linux-gnu.2.17`:
+
+```toml
+[targets.java.jvm]
+enabled = true
+host_targets = ["linux-x86_64.2.17"]
+jni_compiler = "zig cc"
+```
+
+With `jni_compiler` set, packaging `linux-x86_64` from macOS no longer needs a separate Linux cross linker: `zigbuild` links the Rust library and `zig cc` links the JNI library.
+
+### Multi-arch Linux from one Linux host
+
+A Linux machine can package both Linux architectures in one `pack java` run. The simplest setup uses `zig` for everything, so no distro cross toolchain or sysroot is needed:
+
+```toml
+[cargo]
+build_command = "zigbuild"
+
+[targets.java.jvm]
+enabled = true
+host_targets = ["linux-x86_64.2.17", "linux-aarch64.2.17"]
+jni_compiler = "zig cc"
+```
+
+```bash
+rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
+boltffi pack java
+```
+
+`cargo-zigbuild` builds and links the Rust library for each target, including C code compiled by build scripts, and `zig cc -target aarch64-linux-gnu.2.17` links the JNI library. The outputs land in `dist/java/native/linux-x86_64/` and `dist/java/native/linux-aarch64/`; the glibc suffixes are optional.
+
+Without `jni_compiler`, BoltFFI looks for a target-prefixed cross compiler for the other architecture in `PATH` (`aarch64-linux-gnu-clang` or `aarch64-linux-gnu-gcc` on an x86_64 host, `x86_64-linux-gnu-clang` or `x86_64-linux-gnu-gcc` on an aarch64 host), or uses the one configured through `CARGO_TARGET_<TRIPLE>_LINKER`, cargo `target.<triple>.linker` or `BOLTFFI_JAVA_LINKER_<TRIPLE>`. It is used for both the JNI library and, through `CARGO_TARGET_<TRIPLE>_LINKER`, the Rust library. With plain `cargo` and `jni_compiler` but no cross linker, BoltFFI fails before building, because the host `cc` cannot link the other architecture; use `zigbuild` or configure a linker.
 
 Cross-host JNI compilation also needs target-appropriate JNI headers. If the active `JAVA_HOME` does not contain the target platform header directory, point BoltFFI at a target-specific JDK or header directory:
 

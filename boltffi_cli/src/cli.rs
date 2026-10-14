@@ -15,7 +15,7 @@ use crate::commands::pack::{
 };
 use crate::commands::verify::VerifyOptions;
 use crate::commands::{run_build, run_check, run_doctor, run_init, run_pack, run_verify};
-use crate::config::{Config, ConfigError};
+use crate::config::{CargoBuildCommand, Config, ConfigError};
 use crate::pack::PackError;
 use crate::reporter;
 use crate::toolchain::AndroidToolchainError;
@@ -43,6 +43,14 @@ pub struct Cli {
         help = "Pass an argument to cargo invocations (repeatable)"
     )]
     pub cargo_args: Vec<String>,
+
+    #[arg(
+        long = "cargo-build-cmd",
+        global = true,
+        value_name = "CMD",
+        help = "Program that runs library builds: cargo, zigbuild, cross, or \"<program> [subcommand]\" (overrides [cargo].build_command)"
+    )]
+    pub cargo_build_command: Option<CargoBuildCommand>,
 
     #[arg(
         long,
@@ -711,12 +719,24 @@ fn pack_execution_options(
 #[derive(Debug, Clone)]
 pub(crate) struct ConfigPaths {
     overlay: Option<PathBuf>,
+    cargo_build_command: Option<CargoBuildCommand>,
+}
+
+impl ConfigPaths {
+    /// Applies command-line settings that take precedence over the loaded config.
+    fn apply_overrides(&self, mut config: Config) -> Config {
+        if let Some(build_command) = &self.cargo_build_command {
+            config.cargo.build_command = build_command.clone();
+        }
+        config
+    }
 }
 
 impl From<&Cli> for ConfigPaths {
     fn from(cli: &Cli) -> Self {
         Self {
             overlay: cli.overlay.clone(),
+            cargo_build_command: cli.cargo_build_command.clone(),
         }
     }
 }
@@ -741,6 +761,7 @@ fn load_config(config_paths: &ConfigPaths) -> Result<Config> {
         Some(overlay_path) => Config::load_with_overlay(&config_path, Some(overlay_path)),
         None => Config::load(&config_path),
     }
+    .map(|config| config_paths.apply_overrides(config))
     .map_err(Into::into)
 }
 
@@ -758,7 +779,7 @@ fn load_config_if_present(config_paths: &ConfigPaths) -> Result<Option<Config>> 
         Some(overlay_path) => Config::load_with_overlay(&config_path, Some(overlay_path)),
         None => Config::load(&config_path),
     }
-    .map(Some)
+    .map(|config| Some(config_paths.apply_overrides(config)))
     .map_err(Into::into)
 }
 
@@ -1100,7 +1121,10 @@ mod tests {
     use crate::commands::doctor::ConfigSummary;
     use crate::commands::pack::PackCommand;
     use crate::target::RustTarget;
-    use crate::{cli::CliError, config::Config};
+    use crate::{
+        cli::CliError,
+        config::{CargoBuildCommand, Config},
+    };
     use clap::Parser;
     use std::path::PathBuf;
 
@@ -1174,6 +1198,7 @@ triple = "wasm32-wasip1"
     fn doctor_falls_back_to_defaults_when_config_load_fails() {
         let config_paths = ConfigPaths {
             overlay: Some(PathBuf::from("boltffi.ci.toml")),
+            cargo_build_command: None,
         };
         let resolved = resolve_doctor_config(
             Err(crate::config::ConfigError::Validation("bad config".to_string()).into()),
@@ -1190,6 +1215,7 @@ triple = "wasm32-wasip1"
     fn missing_base_config_fails_when_overlay_is_requested() {
         let config_paths = ConfigPaths {
             overlay: Some(PathBuf::from("boltffi.ci.toml")),
+            cargo_build_command: None,
         };
 
         let error =
@@ -1204,6 +1230,7 @@ triple = "wasm32-wasip1"
     fn doctor_warns_when_overlay_is_requested_without_base_config() {
         let config_paths = ConfigPaths {
             overlay: Some(PathBuf::from("boltffi.ci.toml")),
+            cargo_build_command: None,
         };
         let resolved = resolve_doctor_config(
             Err(CliError::ConfigNotFound(PathBuf::from("boltffi.toml"))),
@@ -1219,7 +1246,10 @@ triple = "wasm32-wasip1"
 
     #[test]
     fn init_uses_current_directory() {
-        let config_paths = ConfigPaths { overlay: None };
+        let config_paths = ConfigPaths {
+            overlay: None,
+            cargo_build_command: None,
+        };
 
         let options = resolve_init_options(Some("mylib".to_string()), &config_paths)
             .expect("init options should resolve");
@@ -1231,6 +1261,7 @@ triple = "wasm32-wasip1"
     fn init_rejects_overlay_config() {
         let config_paths = ConfigPaths {
             overlay: Some(PathBuf::from("boltffi.ci.toml")),
+            cargo_build_command: None,
         };
 
         let error = match resolve_init_options(None, &config_paths) {
@@ -1430,6 +1461,33 @@ enabled = true
                     && options.execution.regenerate
                     && !options.execution.no_build
         )));
+    }
+
+    #[test]
+    fn cargo_build_command_flag_overrides_config() {
+        let config = || {
+            parse_config(
+                r#"
+[package]
+name = "mylib"
+
+[cargo]
+build_command = "cross"
+"#,
+            )
+        };
+
+        let cli = Cli::try_parse_from(["boltffi", "--cargo-build-cmd", "zigbuild", "pack", "java"])
+            .expect("cli parse should succeed");
+        let overridden = ConfigPaths::from(&cli).apply_overrides(config());
+        assert_eq!(overridden.cargo.build_command, CargoBuildCommand::Zigbuild);
+
+        let cli =
+            Cli::try_parse_from(["boltffi", "pack", "java"]).expect("cli parse should succeed");
+        let kept = ConfigPaths::from(&cli).apply_overrides(config());
+        assert_eq!(kept.cargo.build_command, CargoBuildCommand::Cross);
+
+        assert!(Cli::try_parse_from(["boltffi", "--cargo-build-cmd", "", "pack", "java"]).is_err());
     }
 
     #[test]

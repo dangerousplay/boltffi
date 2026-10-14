@@ -1,6 +1,9 @@
+use std::fmt;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use boltffi_backend::target::jvm::NativeLibraries;
+use serde::de::IntoDeserializer;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -249,6 +252,172 @@ impl NativeHostIdentifier for JavaHostTarget {
 
     fn unsupported_host_message() -> String {
         "JVM packaging is only supported on darwin-arm64, darwin-x86_64, linux-x86_64, linux-aarch64, and windows-x86_64 hosts".to_string()
+    }
+}
+
+/// Minimum glibc version a Linux JVM host target is linked against, written
+/// `<major>.<minor>` after the host name (`linux-x86_64.2.17`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GlibcVersion {
+    major: u16,
+    minor: u16,
+}
+
+impl FromStr for GlibcVersion {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let component = |part: Option<&str>| {
+            part.filter(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+                .and_then(|part| part.parse::<u16>().ok())
+        };
+        let mut parts = value.split('.');
+        match (
+            component(parts.next()),
+            component(parts.next()),
+            parts.next(),
+        ) {
+            (Some(major), Some(minor), None) => Ok(Self { major, minor }),
+            _ => Err(format!(
+                "invalid glibc version '{value}': expected <major>.<minor>, such as 2.17"
+            )),
+        }
+    }
+}
+
+impl fmt::Display for GlibcVersion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}.{}", self.major, self.minor)
+    }
+}
+
+/// A requested `[targets.java.jvm].host_targets` entry: a JVM host plus an
+/// optional glibc floor for Linux hosts (`linux-x86_64.2.17`).
+///
+/// The glibc version only changes the target passed to the build command
+/// (`x86_64-unknown-linux-gnu.2.17`, understood by `cargo-zigbuild`); artifact
+/// directories and the native output layout keep using the base host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct JavaJvmHostTarget {
+    pub host: JavaHostTarget,
+    pub glibc_version: Option<GlibcVersion>,
+}
+
+impl JavaJvmHostTarget {
+    pub const DEFAULTS: &'static [Self] = &[Self {
+        host: JavaHostTarget::Current,
+        glibc_version: None,
+    }];
+
+    /// Resolves `current`, drops exact duplicates, and rejects a glibc version on
+    /// a non-Linux host or the same host requested with different glibc versions.
+    pub fn resolve_requested(targets: &[Self]) -> Result<Vec<Self>, String> {
+        let current_host = JavaHostTarget::current()
+            .ok_or_else(<JavaHostTarget as NativeHostIdentifier>::unsupported_host_message)?;
+        let mut resolved: Vec<Self> = Vec::new();
+        for requested in targets {
+            let target = Self {
+                host: match requested.host {
+                    JavaHostTarget::Current => current_host,
+                    host => host,
+                },
+                glibc_version: requested.glibc_version,
+            };
+            if target.glibc_version.is_some() && !is_linux_host(target.host) {
+                return Err(format!(
+                    "host target '{requested}' resolves to {}; a glibc version is only valid for linux hosts",
+                    target.host.canonical_name()
+                ));
+            }
+            match resolved
+                .iter()
+                .find(|existing| existing.host == target.host)
+            {
+                Some(existing) if *existing == target => {}
+                Some(existing) => {
+                    return Err(format!(
+                        "host target {} is requested as both '{existing}' and '{target}'",
+                        target.host.canonical_name()
+                    ));
+                }
+                None => resolved.push(target),
+            }
+        }
+        Ok(resolved)
+    }
+
+    /// The `--target` value for `rust_target_triple`, with the glibc version appended.
+    pub fn cargo_target(glibc_version: Option<GlibcVersion>, rust_target_triple: &str) -> String {
+        match glibc_version {
+            Some(glibc_version) => format!("{rust_target_triple}.{glibc_version}"),
+            None => rust_target_triple.to_string(),
+        }
+    }
+}
+
+fn is_linux_host(host: JavaHostTarget) -> bool {
+    matches!(
+        host,
+        JavaHostTarget::LinuxX86_64 | JavaHostTarget::LinuxAarch64
+    )
+}
+
+impl From<JavaHostTarget> for JavaJvmHostTarget {
+    fn from(host: JavaHostTarget) -> Self {
+        Self {
+            host,
+            glibc_version: None,
+        }
+    }
+}
+
+impl FromStr for JavaJvmHostTarget {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (host, glibc_version) = match value.split_once('.') {
+            Some((host, glibc_version)) => (host, Some(glibc_version.parse::<GlibcVersion>()?)),
+            None => (value, None),
+        };
+        let host = JavaHostTarget::deserialize(host.into_deserializer())
+            .map_err(|error: serde::de::value::Error| error.to_string())?;
+        if glibc_version.is_some()
+            && !matches!(host, JavaHostTarget::Current)
+            && !is_linux_host(host)
+        {
+            return Err(format!(
+                "host target '{value}': a glibc version is only valid for linux hosts"
+            ));
+        }
+        Ok(Self {
+            host,
+            glibc_version,
+        })
+    }
+}
+
+impl TryFrom<String> for JavaJvmHostTarget {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<JavaJvmHostTarget> for String {
+    fn from(target: JavaJvmHostTarget) -> Self {
+        target.to_string()
+    }
+}
+
+impl fmt::Display for JavaJvmHostTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.host.canonical_name())?;
+        match self.glibc_version {
+            Some(glibc_version) => write!(formatter, ".{glibc_version}"),
+            None => Ok(()),
+        }
     }
 }
 
@@ -663,9 +832,110 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        Architecture, BuiltLibrary, CSharpRuntimeIdentifier, JavaHostTarget, NativeHostIdentifier,
-        NativeHostPlatform, Platform, RustTarget,
+        Architecture, BuiltLibrary, CSharpRuntimeIdentifier, GlibcVersion, JavaHostTarget,
+        JavaJvmHostTarget, NativeHostIdentifier, NativeHostPlatform, Platform, RustTarget,
     };
+
+    fn jvm_host(value: &str) -> Result<JavaJvmHostTarget, String> {
+        value.parse()
+    }
+
+    #[test]
+    fn parses_jvm_host_targets_with_glibc_version() {
+        let target = jvm_host("linux-x86_64.2.17").expect("glibc suffix");
+        assert_eq!(target.host, JavaHostTarget::LinuxX86_64);
+        assert_eq!(target.glibc_version, Some("2.17".parse().unwrap()));
+        assert_eq!(target.to_string(), "linux-x86_64.2.17");
+
+        let target = jvm_host("linux-arm64.2.28").expect("alias with glibc suffix");
+        assert_eq!(target.host, JavaHostTarget::LinuxAarch64);
+        assert_eq!(target.to_string(), "linux-aarch64.2.28");
+
+        let target = jvm_host("darwin-arm64").expect("plain host");
+        assert_eq!(target, JavaJvmHostTarget::from(JavaHostTarget::DarwinArm64));
+        assert_eq!(target.to_string(), "darwin-arm64");
+        assert!(jvm_host("current.2.17").is_ok());
+    }
+
+    #[test]
+    fn rejects_malformed_glibc_versions_and_non_linux_hosts() {
+        for value in [
+            "linux-x86_64.",
+            "linux-x86_64.2",
+            "linux-x86_64.2.",
+            "linux-x86_64.2.17.1",
+            "linux-x86_64.v2.17",
+            "linux-x86_64.2.x",
+            "linux-x86_64.+2.17",
+            "linux-x86_64.99999.1",
+        ] {
+            let error = jvm_host(value).expect_err(value);
+            assert!(error.contains("invalid glibc version"), "{value}: {error}");
+        }
+        for value in ["darwin-arm64.2.17", "windows-x86_64.2.17"] {
+            let error = jvm_host(value).expect_err(value);
+            assert!(
+                error.contains("only valid for linux hosts"),
+                "{value}: {error}"
+            );
+        }
+        assert!(jvm_host("solaris-x86_64.2.17").is_err());
+        assert!("2.17".parse::<GlibcVersion>().is_ok());
+    }
+
+    #[test]
+    fn jvm_host_targets_round_trip_through_toml() {
+        #[derive(serde::Deserialize, serde::Serialize)]
+        struct Targets {
+            host_targets: Vec<JavaJvmHostTarget>,
+        }
+        let input = "host_targets = [\"current\", \"linux-x86_64.2.17\", \"darwin-arm64\"]\n";
+        let parsed: Targets = toml::from_str(input).expect("host targets parse");
+        assert_eq!(toml::to_string(&parsed).expect("serialize"), input);
+        assert!(toml::from_str::<Targets>("host_targets = [\"linux-x86_64.2\"]").is_err());
+    }
+
+    #[test]
+    fn resolves_jvm_host_targets_with_glibc_versions() {
+        let resolve = |values: &[&str]| {
+            let targets = values
+                .iter()
+                .map(|value| jvm_host(value).unwrap())
+                .collect::<Vec<_>>();
+            JavaJvmHostTarget::resolve_requested(&targets)
+        };
+
+        let resolved = resolve(&["linux-x86_64.2.17", "linux-x86_64.2.17", "linux-aarch64"])
+            .expect("resolved");
+        assert_eq!(
+            resolved.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            ["linux-x86_64.2.17", "linux-aarch64"]
+        );
+
+        let error = resolve(&["linux-x86_64", "linux-x86_64.2.17"]).expect_err("conflict");
+        assert!(error.contains("requested as both 'linux-x86_64' and 'linux-x86_64.2.17'"));
+
+        let current_is_linux = matches!(
+            JavaHostTarget::current(),
+            Some(JavaHostTarget::LinuxX86_64 | JavaHostTarget::LinuxAarch64)
+        );
+        assert_eq!(resolve(&["current.2.17"]).is_ok(), current_is_linux);
+    }
+
+    #[test]
+    fn appends_glibc_version_to_the_cargo_target_only() {
+        assert_eq!(
+            JavaJvmHostTarget::cargo_target(
+                Some("2.17".parse().unwrap()),
+                "x86_64-unknown-linux-gnu"
+            ),
+            "x86_64-unknown-linux-gnu.2.17"
+        );
+        assert_eq!(
+            JavaJvmHostTarget::cargo_target(None, "aarch64-unknown-linux-gnu"),
+            "aarch64-unknown-linux-gnu"
+        );
+    }
 
     #[test]
     fn apple_targets_use_static_libraries() {

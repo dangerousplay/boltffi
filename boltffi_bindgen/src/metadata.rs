@@ -30,6 +30,7 @@ pub struct BindingMetadataBuild {
     toolchain_selector: Option<String>,
     cargo_args: Result<MetadataCargoArgs, LibraryCargoArgsError>,
     cargo_environment: Vec<(OsString, OsString)>,
+    rustc_command: Option<CargoRustcCommand>,
 }
 
 impl BindingMetadataBuild {
@@ -42,6 +43,7 @@ impl BindingMetadataBuild {
             toolchain_selector: None,
             cargo_args: Ok(MetadataCargoArgs::default()),
             cargo_environment: Vec::new(),
+            rustc_command: None,
         }
     }
 
@@ -80,6 +82,12 @@ impl BindingMetadataBuild {
             .into_iter()
             .map(|(key, value)| (key.into(), value.into()))
             .collect();
+        self
+    }
+
+    /// Runs the metadata build through another program than `$CARGO rustc`.
+    pub fn rustc_command(mut self, rustc_command: CargoRustcCommand) -> Self {
+        self.rustc_command = Some(rustc_command);
         self
     }
 
@@ -445,18 +453,22 @@ impl<'build> CargoBuild<'build> {
         let surface = self.build.surface.unwrap_or_else(|| {
             BindingMetadataSurface::from_target_triple(self.build.target.as_deref())
         });
-        let mut command = Command::new(CargoProgram::from_env().into_os_string());
+        let toolchain_selector = self.build.toolchain_selector.as_deref();
+        let mut command = match &self.build.rustc_command {
+            Some(rustc_command) => rustc_command.command(toolchain_selector),
+            None => {
+                let mut command = Command::new(CargoProgram::from_env().into_os_string());
+                command.args(toolchain_selector).arg("rustc");
+                command
+            }
+        };
         command.envs(
             self.build
                 .cargo_environment
                 .iter()
                 .map(|(key, value)| (key, value)),
         );
-        if let Some(toolchain_selector) = self.build.toolchain_selector.as_deref() {
-            command.arg(toolchain_selector);
-        }
         command
-            .arg("rustc")
             .arg("--lib")
             .arg("--message-format=json-render-diagnostics")
             .arg("--manifest-path")
@@ -484,6 +496,42 @@ impl<'build> CargoBuild<'build> {
             .arg("boltffi_metadata")
             .arg("--cfg")
             .arg(format!("boltffi_binding_surface_{}", surface.as_str()));
+        command
+    }
+}
+
+/// Program and subcommand that stand in for `cargo rustc` in the metadata
+/// build, such as `cross rustc` or `cargo-zigbuild rustc`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CargoRustcCommand {
+    program: OsString,
+    subcommand: Vec<String>,
+}
+
+impl CargoRustcCommand {
+    /// Creates a command that runs `program` followed by `subcommand`.
+    pub fn new(program: impl Into<OsString>, subcommand: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            program: program.into(),
+            subcommand: subcommand.into_iter().collect(),
+        }
+    }
+
+    /// A `+toolchain` selector is an argument only for `cargo`; other programs
+    /// receive it as `RUSTUP_TOOLCHAIN`.
+    fn command(&self, toolchain_selector: Option<&str>) -> Command {
+        let mut command = Command::new(&self.program);
+        if let Some(toolchain_selector) = toolchain_selector {
+            if self.program == "cargo" {
+                command.arg(toolchain_selector);
+            } else {
+                command.env(
+                    "RUSTUP_TOOLCHAIN",
+                    toolchain_selector.trim_start_matches('+'),
+                );
+            }
+        }
+        command.args(&self.subcommand);
         command
     }
 }
@@ -815,7 +863,7 @@ mod tests {
 
     use super::{
         BindingMetadataBuild, BindingMetadataBuildError, CargoBuild, CargoManifest,
-        MetadataCargoArgs, MetadataFeatures, SourceRoot,
+        CargoRustcCommand, MetadataCargoArgs, MetadataFeatures, SourceRoot,
     };
     use crate::artifact::BindingMetadataReadError;
     use crate::cargo::LibraryCargoArgsError;
@@ -885,6 +933,46 @@ mod tests {
         assert!(environment.iter().any(|(key, value)| {
             *key == OsStr::new("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER")
                 && *value == Some(OsStr::new("/opt/cross/bin/clang"))
+        }));
+    }
+
+    #[test]
+    fn cargo_build_runs_through_a_configured_rustc_command() {
+        let build = BindingMetadataBuild::new("/workspace/ffi/Cargo.toml")
+            .target("aarch64-unknown-linux-gnu")
+            .rustup_toolchain("+nightly")
+            .rustc_command(CargoRustcCommand::new("cross", ["rustc".to_string()]));
+        let manifest = CargoManifest {
+            path: PathBuf::from("/workspace/ffi/Cargo.toml"),
+        };
+        let source_root = SourceRoot {
+            path: PathBuf::from("/workspace/ffi/src/lib.rs"),
+        };
+        let command = CargoBuild::new(
+            &build,
+            &manifest,
+            &source_root,
+            build.cargo_args.as_ref().unwrap(),
+            MetadataFeatures {
+                names: BTreeSet::new(),
+            },
+            None,
+        )
+        .command();
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(command.get_program(), "cross");
+        assert_eq!(arguments[..2], ["rustc", "--lib"]);
+        assert!(
+            arguments
+                .windows(2)
+                .any(|arguments| arguments == ["--target", "aarch64-unknown-linux-gnu"])
+        );
+        assert!(command.get_envs().any(|(key, value)| {
+            key == OsStr::new("RUSTUP_TOOLCHAIN") && value == Some(OsStr::new("nightly"))
         }));
     }
 

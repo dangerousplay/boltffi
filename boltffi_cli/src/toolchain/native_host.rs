@@ -7,7 +7,8 @@ use crate::cargo::config::{
     extract_cargo_config_args, resolve_cargo_config_path,
 };
 use crate::cli::{CliError, Result};
-use crate::target::{JavaHostTarget, NativeHostPlatform};
+use crate::config::targets::java::JniCompilerCommand;
+use crate::target::{GlibcVersion, JavaHostTarget, NativeHostPlatform};
 
 #[cfg(test)]
 use crate::cargo::config::{
@@ -111,12 +112,78 @@ impl MsvcStyleCompiler {
     }
 }
 
+/// `[targets.java.jvm].jni_compiler` for one host target. It replaces the
+/// discovered JNI compiler, ahead of `CARGO_TARGET_<T>_LINKER`, cargo
+/// `target.<T>.linker` and `BOLTFFI_JAVA_LINKER_<T>`.
+#[derive(Debug, Clone, Copy)]
+pub struct JniCompilerOverride<'a> {
+    pub command: &'a JniCompilerCommand,
+    pub glibc_version: Option<GlibcVersion>,
+}
+
+impl JniCompilerOverride<'_> {
+    /// Program plus leading arguments. `zig cc` / `zig c++` get a zig
+    /// `-target` derived from the Rust triple; other drivers get the target
+    /// arguments the discovered compiler would have received.
+    fn resolve(
+        self,
+        rust_target_triple: &str,
+        target_args: impl FnOnce(&Path) -> Result<Vec<String>>,
+    ) -> Result<(PathBuf, Vec<String>)> {
+        let program = resolve_target_compiler_value(self.command.program()).ok_or_else(|| {
+            CliError::CommandFailed {
+                command: format!(
+                    "configured JNI compiler from targets.java.jvm.jni_compiler does not resolve to an executable: {}",
+                    self.command.program()
+                ),
+                status: None,
+            }
+        })?;
+        let target_args = match (linker_program_name(&program), self.command.args()) {
+            (Some("zig"), [driver, ..]) if driver == "cc" || driver == "c++" => vec![
+                "-target".to_string(),
+                zig_target(rust_target_triple, self.glibc_version),
+            ],
+            (Some("zig"), _) => {
+                return Err(CliError::CommandFailed {
+                    command: format!(
+                        "targets.java.jvm.jni_compiler '{}' must use zig's C driver, such as \"zig cc\"",
+                        self.command
+                    ),
+                    status: None,
+                });
+            }
+            _ => target_args(&program)?,
+        };
+        let args = self.command.args().iter().cloned().chain(target_args);
+        Ok((program, args.collect()))
+    }
+}
+
+/// Zig's spelling of a Rust target triple, with the glibc version appended
+/// for `-linux-gnu*` targets: `x86_64-unknown-linux-gnu` + 2.17 becomes
+/// `x86_64-linux-gnu.2.17`.
+fn zig_target(rust_target_triple: &str, glibc_version: Option<GlibcVersion>) -> String {
+    let parts = rust_target_triple.split('-').collect::<Vec<_>>();
+    let target = match parts.as_slice() {
+        [arch, "apple", "darwin"] => format!("{arch}-macos"),
+        [arch, _, "windows", "gnullvm"] => format!("{arch}-windows-gnu"),
+        [arch, _, os @ ("linux" | "windows"), abi] => format!("{arch}-{os}-{abi}"),
+        _ => rust_target_triple.to_string(),
+    };
+    match glibc_version {
+        Some(version) if target.contains("-linux-gnu") => format!("{target}.{version}"),
+        _ => target,
+    }
+}
+
 impl NativeHostToolchain {
     pub fn discover_matrix(
         toolchain_selector: Option<&str>,
         cargo_args: &[String],
         cargo_manifest_path: &Path,
         targets: &[JavaHostTarget],
+        jni_compiler: Option<&JniCompilerCommand>,
     ) -> Result<Vec<(JavaHostTarget, Self)>> {
         let current_host = JavaHostTarget::current().ok_or_else(|| CliError::CommandFailed {
             command:
@@ -134,6 +201,10 @@ impl NativeHostToolchain {
                     cargo_manifest_path,
                     target,
                     current_host,
+                    jni_compiler.map(|command| JniCompilerOverride {
+                        command,
+                        glibc_version: None,
+                    }),
                 )
                 .map(|toolchain| (target, toolchain))
             })
@@ -146,6 +217,7 @@ impl NativeHostToolchain {
         cargo_manifest_path: &Path,
         target: JavaHostTarget,
         current_host: JavaHostTarget,
+        jni_compiler: Option<JniCompilerOverride<'_>>,
     ) -> Result<Self> {
         let cargo_args = Self::cargo_discovery_args(cargo_args, cargo_manifest_path);
         Self::discover_for_platform(
@@ -154,6 +226,7 @@ impl NativeHostToolchain {
             target.native_host_platform(),
             current_host.native_host_platform(),
             "JVM",
+            jni_compiler,
         )
     }
 
@@ -163,7 +236,14 @@ impl NativeHostToolchain {
         target: NativeHostPlatform,
         current_host: NativeHostPlatform,
     ) -> Result<Self> {
-        Self::discover_for_platform(toolchain_selector, cargo_args, target, current_host, "C#")
+        Self::discover_for_platform(
+            toolchain_selector,
+            cargo_args,
+            target,
+            current_host,
+            "C#",
+            None,
+        )
     }
 
     pub fn resolve_csharp_no_build_rust_target_triple(
@@ -195,6 +275,7 @@ impl NativeHostToolchain {
         target: NativeHostPlatform,
         current_host: NativeHostPlatform,
         platform_name: &str,
+        jni_compiler: Option<JniCompilerOverride<'_>>,
     ) -> Result<Self> {
         ensure_supported_native_host_pair(current_host, target, platform_name)?;
         let rust_target_triple =
@@ -217,18 +298,27 @@ impl NativeHostToolchain {
                 NativeHostPlatform::DarwinArm64 | NativeHostPlatform::DarwinX86_64,
                 NativeHostPlatform::DarwinX86_64,
             ) => {
-                let linker_program =
-                    which::which("clang").map_err(|_| CliError::CommandFailed {
-                        command: "clang not found in PATH for JVM desktop linking".to_string(),
-                        status: None,
-                    })?;
-                let sdk_root = apple_sdk_root()?;
-                let linker_args = vec![
-                    "-target".to_string(),
-                    rust_target_triple.clone(),
-                    "-isysroot".to_string(),
-                    sdk_root.display().to_string(),
-                ];
+                let darwin_args = |_: &Path| {
+                    Ok(vec![
+                        "-target".to_string(),
+                        rust_target_triple.clone(),
+                        "-isysroot".to_string(),
+                        apple_sdk_root()?.display().to_string(),
+                    ])
+                };
+                let (linker_program, linker_args) = match jni_compiler {
+                    Some(jni_compiler) => jni_compiler.resolve(&rust_target_triple, darwin_args)?,
+                    None => {
+                        let linker_program =
+                            which::which("clang").map_err(|_| CliError::CommandFailed {
+                                command: "clang not found in PATH for JVM desktop linking"
+                                    .to_string(),
+                                status: None,
+                            })?;
+                        let linker_args = darwin_args(&linker_program)?;
+                        (linker_program, linker_args)
+                    }
+                };
                 Ok(Self {
                     rust_target_triple: rust_target_triple.clone(),
                     cargo_linker_env: None,
@@ -240,26 +330,54 @@ impl NativeHostToolchain {
             (
                 NativeHostPlatform::DarwinArm64 | NativeHostPlatform::DarwinX86_64,
                 NativeHostPlatform::LinuxX86_64,
-            ) => {
+            )
+            | (NativeHostPlatform::LinuxX86_64, NativeHostPlatform::LinuxAarch64)
+            | (NativeHostPlatform::LinuxAarch64, NativeHostPlatform::LinuxX86_64) => {
                 let (cargo_linker_program, jni_compiler_program, jni_compiler_args) =
-                    resolve_linux_cross_toolchain(cargo_args, &rust_target_triple)?;
-                let cargo_linker_program =
-                    if linux_cross_linker_args(&cargo_linker_program, &rust_target_triple)
-                        .is_empty()
-                    {
-                        cargo_linker_program
-                    } else {
-                        write_linux_cross_linker_wrapper(
-                            &cargo_linker_program,
-                            &rust_target_triple,
-                        )?
+                    match jni_compiler {
+                        // The build command (e.g. cargo-zigbuild) brings its own
+                        // linker, so a cross linker is only used when configured.
+                        Some(jni_compiler) => {
+                            let (program, args) =
+                                jni_compiler.resolve(&rust_target_triple, |program| {
+                                    validate_linux_cross_linker_program(
+                                        program,
+                                        &rust_target_triple,
+                                    )?;
+                                    Ok(linux_cross_linker_args(program, &rust_target_triple))
+                                })?;
+                            let cargo_linker_program = resolve_target_linker_from_values(
+                                configured_linux_cross_linker_values(
+                                    cargo_args,
+                                    &rust_target_triple,
+                                ),
+                                &linux_cross_label(&rust_target_triple),
+                            )?;
+                            (cargo_linker_program, program, args)
+                        }
+                        None => {
+                            let (cargo_linker_program, program, args) =
+                                resolve_linux_cross_toolchain(cargo_args, &rust_target_triple)?;
+                            (Some(cargo_linker_program), program, args)
+                        }
                     };
+                let cargo_linker_env = cargo_linker_program
+                    .map(|program| {
+                        let program =
+                            if linux_cross_linker_args(&program, &rust_target_triple).is_empty() {
+                                program
+                            } else {
+                                write_linux_cross_linker_wrapper(&program, &rust_target_triple)?
+                            };
+                        Ok::<_, CliError>((
+                            cargo_linker_env_key(&rust_target_triple),
+                            program.display().to_string(),
+                        ))
+                    })
+                    .transpose()?;
                 Ok(Self {
                     rust_target_triple: rust_target_triple.clone(),
-                    cargo_linker_env: Some((
-                        cargo_linker_env_key(&rust_target_triple),
-                        cargo_linker_program.display().to_string(),
-                    )),
+                    cargo_linker_env,
                     jni_compiler_program,
                     jni_compiler_args,
                     jni_rustflag_linker_args: rustflag_linker_args,
@@ -267,8 +385,21 @@ impl NativeHostToolchain {
             }
             (NativeHostPlatform::LinuxX86_64, NativeHostPlatform::LinuxX86_64)
             | (NativeHostPlatform::LinuxAarch64, NativeHostPlatform::LinuxAarch64) => {
-                let (linker_program, linker_args) =
-                    resolve_linux_host_linker(toolchain_selector, cargo_args, &rust_target_triple)?;
+                let (linker_program, linker_args) = match jni_compiler {
+                    Some(jni_compiler) => jni_compiler.resolve(&rust_target_triple, |program| {
+                        let host_triple = rustc_host_triple(toolchain_selector)?;
+                        Ok(linux_host_linker_args(
+                            program,
+                            &rust_target_triple,
+                            &host_triple,
+                        ))
+                    })?,
+                    None => resolve_linux_host_linker(
+                        toolchain_selector,
+                        cargo_args,
+                        &rust_target_triple,
+                    )?,
+                };
                 Ok(Self {
                     rust_target_triple,
                     cargo_linker_env: None,
@@ -281,11 +412,21 @@ impl NativeHostToolchain {
                 NativeHostPlatform::WindowsX86_64 | NativeHostPlatform::WindowsAarch64,
                 NativeHostPlatform::WindowsX86_64 | NativeHostPlatform::WindowsAarch64,
             ) => {
-                let (linker_program, linker_args) = resolve_windows_host_linker(
-                    toolchain_selector,
-                    cargo_args,
-                    &rust_target_triple,
-                )?;
+                let (linker_program, linker_args) = match jni_compiler {
+                    Some(jni_compiler) => jni_compiler.resolve(&rust_target_triple, |program| {
+                        let host_triple = rustc_host_triple(toolchain_selector)?;
+                        Ok(windows_host_linker_args(
+                            program,
+                            &rust_target_triple,
+                            &host_triple,
+                        ))
+                    })?,
+                    None => resolve_windows_host_linker(
+                        toolchain_selector,
+                        cargo_args,
+                        &rust_target_triple,
+                    )?,
+                };
                 Ok(Self {
                     rust_target_triple,
                     cargo_linker_env: None,
@@ -318,6 +459,14 @@ impl NativeHostToolchain {
 
     pub fn jni_compiler_program(&self) -> &Path {
         &self.jni_compiler_program
+    }
+
+    /// The JNI compiler with its leading arguments, for verbose output.
+    pub fn jni_compiler_display(&self) -> String {
+        std::iter::once(self.jni_compiler_program.display().to_string())
+            .chain(self.jni_compiler_args.iter().cloned())
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     pub(crate) fn msvc_style_compiler(&self) -> Option<MsvcStyleCompiler> {
@@ -357,11 +506,8 @@ fn ensure_supported_native_host_pair(
             NativeHostPlatform::DarwinArm64 | NativeHostPlatform::DarwinX86_64,
             NativeHostPlatform::LinuxX86_64,
         ) | (
-            NativeHostPlatform::LinuxX86_64,
-            NativeHostPlatform::LinuxX86_64
-        ) | (
-            NativeHostPlatform::LinuxAarch64,
-            NativeHostPlatform::LinuxAarch64
+            NativeHostPlatform::LinuxX86_64 | NativeHostPlatform::LinuxAarch64,
+            NativeHostPlatform::LinuxX86_64 | NativeHostPlatform::LinuxAarch64,
         ) | (
             NativeHostPlatform::WindowsX86_64 | NativeHostPlatform::WindowsAarch64,
             NativeHostPlatform::WindowsX86_64 | NativeHostPlatform::WindowsAarch64,
@@ -730,14 +876,15 @@ fn resolve_linux_cross_toolchain(
     cargo_args: &[String],
     rust_target_triple: &str,
 ) -> Result<(PathBuf, PathBuf, Vec<String>)> {
-    let configured_values =
-        configured_linux_x86_64_cross_linker_values(cargo_args, rust_target_triple);
+    let configured_values = configured_linux_cross_linker_values(cargo_args, rust_target_triple);
+    let label = linux_cross_label(rust_target_triple);
     let cargo_linker_program =
-        resolve_target_linker_from_values(configured_values.clone(), "Linux x86_64")?;
-    let jni_compiler_program =
-        resolve_target_compiler_from_values(configured_values, "Linux x86_64")?
-            .or_else(|| discover_default_linux_x86_64_cross_compiler(rust_target_triple))
-            .ok_or_else(|| missing_linux_x86_64_cross_linker_error(rust_target_triple))?;
+        resolve_target_linker_from_values(configured_values.clone(), &label)?;
+    let jni_compiler_program = resolve_target_compiler_from_values(configured_values, &label)?
+        .or_else(|| {
+            discover_default_linux_cross_compiler(rust_target_triple, std::env::var_os("PATH"))
+        })
+        .ok_or_else(|| missing_linux_cross_linker_error(rust_target_triple))?;
 
     if let Some(cargo_linker_program) = cargo_linker_program.as_ref() {
         validate_linux_cross_linker_program(cargo_linker_program, rust_target_triple)?;
@@ -810,14 +957,38 @@ fn default_windows_jni_compiler_candidates(rust_target_triple: &str) -> Vec<&'st
     }
 }
 
-fn discover_default_linux_x86_64_cross_compiler(rust_target_triple: &str) -> Option<PathBuf> {
-    if rust_target_triple != default_linux_rust_target_triple(NativeHostPlatform::LinuxX86_64) {
-        return None;
-    }
-
-    ["x86_64-linux-gnu-clang", "x86_64-linux-gnu-gcc"]
+/// Target-prefixed cross compilers for the default glibc triples, such as
+/// `aarch64-linux-gnu-gcc` from a distro cross toolchain.
+fn discover_default_linux_cross_compiler(
+    rust_target_triple: &str,
+    search_path: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    let current_directory = std::env::current_dir().ok()?;
+    default_linux_cross_compiler_candidates(rust_target_triple)
         .into_iter()
-        .find_map(|candidate| which::which(candidate).ok())
+        .find_map(|candidate| {
+            which::which_in(candidate, search_path.as_ref(), &current_directory).ok()
+        })
+}
+
+fn default_linux_cross_compiler_candidates(rust_target_triple: &str) -> Vec<String> {
+    let arch = rust_target_triple.split('-').next().unwrap_or_default();
+    if !matches!(
+        rust_target_triple,
+        "x86_64-unknown-linux-gnu" | "aarch64-unknown-linux-gnu"
+    ) {
+        return Vec::new();
+    }
+    vec![
+        format!("{arch}-linux-gnu-clang"),
+        format!("{arch}-linux-gnu-gcc"),
+    ]
+}
+
+/// `Linux x86_64` / `Linux aarch64`, for linker error messages.
+fn linux_cross_label(rust_target_triple: &str) -> String {
+    let arch = rust_target_triple.split('-').next().unwrap_or_default();
+    format!("Linux {arch}")
 }
 
 fn resolve_target_linker_from_values<I>(
@@ -1015,7 +1186,8 @@ fn validate_linux_cross_linker_program(
     if is_host_only_linux_cross_driver_name(name) {
         return Err(CliError::CommandFailed {
             command: format!(
-                "configured Linux x86_64 linker '{}' is a host-only driver and cannot target '{}'; use clang with --target support or a target-prefixed cross linker",
+                "configured {} linker '{}' is a host-only driver and cannot target '{}'; use clang with --target support or a target-prefixed cross linker",
+                linux_cross_label(rust_target_triple),
                 linker_program.display(),
                 rust_target_triple,
             ),
@@ -1112,23 +1284,30 @@ fn apple_sdk_root() -> Result<PathBuf> {
     Ok(PathBuf::from(sdk_root))
 }
 
-fn configured_linux_x86_64_cross_linker_values(
+fn configured_linux_cross_linker_values(
     cargo_args: &[String],
     rust_target_triple: &str,
 ) -> Vec<ConfiguredValue> {
     let cargo_env_key = cargo_linker_env_key(rust_target_triple);
-    configured_linux_x86_64_cross_linker_values_with_sources(
+    let boltffi_env_key = boltffi_java_linker_env_key(rust_target_triple);
+    configured_linux_cross_linker_values_with_sources(
         cargo_args,
         rust_target_triple,
-        (rust_target_triple == default_linux_rust_target_triple(NativeHostPlatform::LinuxX86_64))
-            .then(|| std::env::var("BOLTFFI_JAVA_LINKER_X86_64_UNKNOWN_LINUX_GNU").ok())
-            .flatten(),
+        std::env::var(&boltffi_env_key).ok(),
         cargo_env_key.clone(),
         std::env::var(&cargo_env_key).ok(),
     )
 }
 
-fn configured_linux_x86_64_cross_linker_values_with_sources(
+/// `BOLTFFI_JAVA_LINKER_<TRIPLE>`, e.g. `BOLTFFI_JAVA_LINKER_AARCH64_UNKNOWN_LINUX_GNU`.
+fn boltffi_java_linker_env_key(target_triple: &str) -> String {
+    format!(
+        "BOLTFFI_JAVA_LINKER_{}",
+        target_triple.replace(['-', '.'], "_").to_uppercase()
+    )
+}
+
+fn configured_linux_cross_linker_values_with_sources(
     cargo_args: &[String],
     rust_target_triple: &str,
     boltffi_linker: Option<String>,
@@ -1146,7 +1325,7 @@ fn configured_linux_x86_64_cross_linker_values_with_sources(
             rust_target_triple,
         ))
         .chain(boltffi_linker.into_iter().map(|value| ConfiguredValue {
-            source: "BOLTFFI_JAVA_LINKER_X86_64_UNKNOWN_LINUX_GNU".to_string(),
+            source: boltffi_java_linker_env_key(rust_target_triple),
             value,
         }))
         .collect()
@@ -1226,21 +1405,20 @@ fn path_is_executable(path: &Path) -> bool {
     }
 }
 
-fn missing_linux_x86_64_cross_linker_error(rust_target_triple: &str) -> CliError {
-    let cargo_env_key = cargo_linker_env_key(rust_target_triple);
-    let mut command = format!(
-        "missing Linux x86_64 desktop linker for JVM packaging target '{}'; set {} or cargo target.{}.linker",
-        rust_target_triple, cargo_env_key, rust_target_triple
-    );
-
-    if rust_target_triple == default_linux_rust_target_triple(NativeHostPlatform::LinuxX86_64) {
-        command.push_str(
-            ", set BOLTFFI_JAVA_LINKER_X86_64_UNKNOWN_LINUX_GNU, or install x86_64-linux-gnu-clang",
-        );
-    }
-
+fn missing_linux_cross_linker_error(rust_target_triple: &str) -> CliError {
+    let candidates = default_linux_cross_compiler_candidates(rust_target_triple);
+    let install_hint = if candidates.is_empty() {
+        String::new()
+    } else {
+        format!(", or install {}", candidates.join(" or "))
+    };
     CliError::CommandFailed {
-        command,
+        command: format!(
+            "missing {} desktop linker for JVM packaging target '{rust_target_triple}'; set [targets.java.jvm].jni_compiler (e.g. \"zig cc\" with [cargo].build_command = \"zigbuild\"), {}, cargo target.{rust_target_triple}.linker or {}{install_hint}",
+            linux_cross_label(rust_target_triple),
+            cargo_linker_env_key(rust_target_triple),
+            boltffi_java_linker_env_key(rust_target_triple),
+        ),
         status: None,
     }
 }
@@ -1717,7 +1895,7 @@ mod tests {
         cargo_config_file_candidates_with_inputs, cargo_config_file_linker_values_with_candidates,
         cargo_config_search_roots, cargo_configured_build_target,
         cargo_inline_configured_linker_values, cargo_linker_env_key, configured_linux_build_target,
-        configured_linux_x86_64_cross_linker_values_with_sources, configured_target_linker_values,
+        configured_linux_cross_linker_values_with_sources, configured_target_linker_values,
         configured_target_rustflag_linker_args,
         configured_target_rustflag_linker_args_with_sources, configured_windows_build_target,
         default_windows_jni_compiler_candidates, ensure_supported_native_host_pair,
@@ -1734,13 +1912,169 @@ mod tests {
         validate_windows_rust_target_triple, windows_host_linker_args,
         write_linux_cross_linker_wrapper,
     };
+    use super::{
+        JniCompilerOverride, discover_default_linux_cross_compiler,
+        missing_linux_cross_linker_error, zig_target,
+    };
     use crate::cli::CliError;
-    use crate::target::NativeHostPlatform;
+    use crate::config::targets::java::JniCompilerCommand;
+    use crate::target::{JavaHostTarget, NativeHostPlatform};
     use std::ffi::OsStr;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn fake_compilers(names: &[&str]) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time went backwards")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("boltffi-jni-compiler-{unique}"));
+        fs::create_dir_all(&directory).expect("create temp dir");
+        for name in names {
+            let path = directory.join(name);
+            fs::write(&path, []).expect("write fake compiler");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+                    .expect("mark fake compiler executable");
+            }
+        }
+        directory
+    }
+
+    fn jni_compiler(value: &str) -> JniCompilerCommand {
+        value.parse().expect("jni_compiler")
+    }
+
+    #[test]
+    fn derives_zig_targets_from_rust_triples() {
+        let glibc = Some("2.17".parse().unwrap());
+        for (rust_triple, glibc_version, expected) in [
+            ("x86_64-unknown-linux-gnu", glibc, "x86_64-linux-gnu.2.17"),
+            ("x86_64-unknown-linux-gnu", None, "x86_64-linux-gnu"),
+            ("aarch64-unknown-linux-gnu", None, "aarch64-linux-gnu"),
+            ("aarch64-unknown-linux-gnu", glibc, "aarch64-linux-gnu.2.17"),
+            ("x86_64-unknown-linux-musl", glibc, "x86_64-linux-musl"),
+            ("x86_64-apple-darwin", None, "x86_64-macos"),
+            ("aarch64-apple-darwin", glibc, "aarch64-macos"),
+            ("x86_64-pc-windows-gnu", None, "x86_64-windows-gnu"),
+            ("aarch64-pc-windows-gnullvm", None, "aarch64-windows-gnu"),
+            ("x86_64-pc-windows-msvc", None, "x86_64-windows-msvc"),
+        ] {
+            assert_eq!(
+                zig_target(rust_triple, glibc_version),
+                expected,
+                "{rust_triple}"
+            );
+        }
+    }
+
+    #[test]
+    fn jni_compiler_override_assembles_program_leading_args_and_target() {
+        let directory = fake_compilers(&["zig", "clang", "cl"]);
+        let at = |name: &str| directory.join(name).display().to_string();
+        let resolve = |value: String, glibc: Option<&str>| {
+            JniCompilerOverride {
+                command: &jni_compiler(&value),
+                glibc_version: glibc.map(|version| version.parse().unwrap()),
+            }
+            .resolve("x86_64-unknown-linux-gnu", |program| {
+                Ok(linux_cross_linker_args(program, "x86_64-unknown-linux-gnu"))
+            })
+        };
+
+        let (program, args) = resolve(format!("{} cc", at("zig")), Some("2.17")).unwrap();
+        assert_eq!(program, directory.join("zig"));
+        assert_eq!(args, ["cc", "-target", "x86_64-linux-gnu.2.17"]);
+
+        let (_, args) = resolve(format!("{} c++ -g", at("zig")), None).unwrap();
+        assert_eq!(args, ["c++", "-g", "-target", "x86_64-linux-gnu"]);
+
+        let (program, args) =
+            resolve(format!("{} -fuse-ld=lld", at("clang")), Some("2.17")).unwrap();
+        assert_eq!(program, directory.join("clang"));
+        assert_eq!(
+            args,
+            ["-fuse-ld=lld", "--target", "x86_64-unknown-linux-gnu"]
+        );
+
+        let error = resolve(at("zig"), None).expect_err("bare zig is not a C driver");
+        assert!(
+            matches!(error, CliError::CommandFailed { command, .. } if command.contains("\"zig cc\""))
+        );
+
+        let error = resolve(at("missing-cc"), None).expect_err("unresolved program");
+        assert!(matches!(
+            error,
+            CliError::CommandFailed { command, .. }
+                if command.contains("targets.java.jvm.jni_compiler does not resolve")
+        ));
+
+        // MSVC drivers keep the MSVC argument path: no target flags on the host.
+        let (program, args) = JniCompilerOverride {
+            command: &jni_compiler(&at("cl")),
+            glibc_version: None,
+        }
+        .resolve("x86_64-pc-windows-msvc", |program| {
+            Ok(windows_host_linker_args(
+                program,
+                "x86_64-pc-windows-msvc",
+                "x86_64-pc-windows-msvc",
+            ))
+        })
+        .unwrap();
+        assert!(args.is_empty());
+        assert_eq!(
+            MsvcStyleCompiler::from_program(&program),
+            Some(MsvcStyleCompiler::Cl)
+        );
+
+        fs::remove_dir_all(&directory).expect("cleanup temp dir");
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn jni_compiler_takes_precedence_over_the_cargo_configured_linker() {
+        let directory = fake_compilers(&["zig"]);
+        let cargo_args = [
+            "--config=target.x86_64-unknown-linux-gnu.linker=\"/nonexistent/linker\"".to_string(),
+        ];
+        let discover = |jni_compiler| {
+            NativeHostToolchain::discover(
+                None,
+                &cargo_args,
+                Path::new("Cargo.toml"),
+                JavaHostTarget::LinuxX86_64,
+                JavaHostTarget::LinuxX86_64,
+                jni_compiler,
+            )
+        };
+
+        let error = discover(None).expect_err("the cargo linker is otherwise used");
+        assert!(matches!(
+            error,
+            CliError::CommandFailed { command, .. } if command.contains("/nonexistent/linker")
+        ));
+        let command = jni_compiler(&format!("{} cc", directory.join("zig").display()));
+        let toolchain = discover(Some(JniCompilerOverride {
+            command: &command,
+            glibc_version: Some("2.17".parse().unwrap()),
+        }))
+        .expect("jni_compiler overrides the cargo linker");
+        assert_eq!(
+            toolchain.jni_compiler_display(),
+            format!(
+                "{} cc -target x86_64-linux-gnu.2.17",
+                directory.join("zig").display()
+            )
+        );
+        assert_eq!(toolchain.cargo_environment().count(), 0);
+
+        fs::remove_dir_all(&directory).expect("cleanup temp dir");
+    }
 
     #[test]
     fn extracts_rustup_toolchain_name_from_selector() {
@@ -2285,7 +2619,7 @@ unix
 
     #[test]
     fn prefers_inline_cargo_linker_over_cargo_target_env() {
-        let values = configured_linux_x86_64_cross_linker_values_with_sources(
+        let values = configured_linux_cross_linker_values_with_sources(
             &["--config=target.x86_64-unknown-linux-gnu.linker='zig'".to_string()],
             "x86_64-unknown-linux-gnu",
             None,
@@ -2304,7 +2638,7 @@ unix
 
     #[test]
     fn prefers_cargo_linker_sources_over_boltffi_linux_linker_override() {
-        let values = configured_linux_x86_64_cross_linker_values_with_sources(
+        let values = configured_linux_cross_linker_values_with_sources(
             &["--config=target.x86_64-unknown-linux-gnu.linker='zig'".to_string()],
             "x86_64-unknown-linux-gnu",
             Some("x86_64-linux-gnu-clang".to_string()),
@@ -2617,6 +2951,100 @@ unix
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn native_host_pair_matrix_allows_linux_cross_arch_pairs() {
+        use NativeHostPlatform::*;
+        for (current_host, target) in [
+            (LinuxX86_64, LinuxAarch64),
+            (LinuxAarch64, LinuxX86_64),
+            (LinuxX86_64, LinuxX86_64),
+            (LinuxAarch64, LinuxAarch64),
+            (DarwinArm64, LinuxX86_64),
+            (DarwinArm64, DarwinX86_64),
+            (WindowsX86_64, WindowsAarch64),
+        ] {
+            ensure_supported_native_host_pair(current_host, target, "JVM").unwrap_or_else(
+                |error| panic!("{current_host:?} -> {target:?} should be allowed: {error:?}"),
+            );
+        }
+        for (current_host, target) in [
+            (LinuxX86_64, DarwinArm64),
+            (LinuxAarch64, WindowsX86_64),
+            (DarwinArm64, LinuxAarch64),
+            (WindowsX86_64, LinuxX86_64),
+            (LinuxX86_64, WindowsAarch64),
+        ] {
+            ensure_supported_native_host_pair(current_host, target, "JVM").expect_err(&format!(
+                "{current_host:?} -> {target:?} should be rejected"
+            ));
+        }
+    }
+
+    #[test]
+    fn discovers_target_prefixed_linux_cross_compilers_on_path() {
+        let both = fake_compilers(&["aarch64-linux-gnu-gcc", "aarch64-linux-gnu-clang"]);
+        let gcc_only = fake_compilers(&["aarch64-linux-gnu-gcc", "x86_64-linux-gnu-gcc"]);
+        let discover = |triple: &str, directory: &Path| {
+            discover_default_linux_cross_compiler(triple, Some(directory.as_os_str().to_owned()))
+        };
+
+        assert_eq!(
+            discover("aarch64-unknown-linux-gnu", &both),
+            Some(both.join("aarch64-linux-gnu-clang"))
+        );
+        assert_eq!(
+            discover("aarch64-unknown-linux-gnu", &gcc_only),
+            Some(gcc_only.join("aarch64-linux-gnu-gcc"))
+        );
+        assert_eq!(
+            discover("x86_64-unknown-linux-gnu", &gcc_only),
+            Some(gcc_only.join("x86_64-linux-gnu-gcc"))
+        );
+        assert_eq!(discover("x86_64-unknown-linux-gnu", &both), None);
+        assert_eq!(discover("aarch64-unknown-linux-musl", &both), None);
+
+        fs::remove_dir_all(&both).expect("cleanup temp dir");
+        fs::remove_dir_all(&gcc_only).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn missing_linux_cross_linker_error_names_every_option() {
+        let CliError::CommandFailed { command, status } =
+            missing_linux_cross_linker_error("aarch64-unknown-linux-gnu")
+        else {
+            panic!("expected CommandFailed");
+        };
+        assert_eq!(status, None);
+        for expected in [
+            "missing Linux aarch64 desktop linker",
+            "[targets.java.jvm].jni_compiler",
+            "zigbuild",
+            "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER",
+            "target.aarch64-unknown-linux-gnu.linker",
+            "BOLTFFI_JAVA_LINKER_AARCH64_UNKNOWN_LINUX_GNU",
+            "aarch64-linux-gnu-clang or aarch64-linux-gnu-gcc",
+        ] {
+            assert!(command.contains(expected), "{expected}: {command}");
+        }
+    }
+
+    #[test]
+    fn boltffi_linux_linker_override_is_keyed_by_target_triple() {
+        let values = configured_linux_cross_linker_values_with_sources(
+            &[],
+            "aarch64-unknown-linux-gnu",
+            Some("aarch64-linux-gnu-gcc".to_string()),
+            "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER".to_string(),
+            None,
+        );
+
+        assert_eq!(values.len(), 1);
+        assert_eq!(
+            values[0].source,
+            "BOLTFFI_JAVA_LINKER_AARCH64_UNKNOWN_LINUX_GNU"
+        );
     }
 
     #[test]

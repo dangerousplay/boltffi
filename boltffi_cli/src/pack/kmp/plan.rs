@@ -96,7 +96,7 @@ mod tests {
 
     use crate::build::CargoBuildProfile;
     use crate::cargo::SelectedLibrary;
-    use crate::config::Config;
+    use crate::config::{CargoBuildCommand, Config};
     use crate::pack::java::plan::{JvmCargoContext, JvmPackagingTarget, PreparedJvmPackaging};
     use crate::target::JavaHostTarget;
     use crate::toolchain::NativeHostToolchain;
@@ -133,6 +133,8 @@ mod tests {
                     ])
                     .unwrap(),
                     toolchain_selector: Some("+nightly".to_string()),
+                    build_command: CargoBuildCommand::Cargo,
+                    glibc_version: None,
                 },
                 toolchain: NativeHostToolchain::discover(
                     None,
@@ -140,6 +142,7 @@ mod tests {
                     Path::new("/tmp/workspace/Cargo.toml"),
                     current_host,
                     current_host,
+                    None,
                 )
                 .expect("native host toolchain"),
             }],
