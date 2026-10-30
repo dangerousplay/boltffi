@@ -17,7 +17,7 @@ use crate::pack::symbols::{
     DebugSymbolArtifact, DebugSymbolArtifactKind, ensure_debug_symbols_profile_has_debuginfo,
     write_debug_symbols_zip,
 };
-use crate::reporter::Reporter;
+use crate::reporter::{Reporter, Step};
 use crate::target::{GlibcVersion, JavaHostTarget, JavaJvmHostTarget, NativeHostPlatform};
 use crate::toolchain::{JniCompilerOverride, NativeHostToolchain};
 
@@ -186,38 +186,45 @@ fn execute_java_pack(config: &Config, plan: JavaPackPlan, reporter: &Reporter) -
         step.finish_success();
     }
 
-    let packaged_outputs = packaging_targets
-        .iter()
-        .map(|packaging_target| {
-            let host_target = packaging_target.cargo_context.host_target;
-            let step = reporter.step(&format!(
-                "Building Rust library for {}",
-                host_target.canonical_name()
-            ));
-            let build_artifacts = build_jvm_native_library(
-                packaging_target,
-                execution.release,
-                Some(&expansion),
-                &step,
+    // One failing host target must not abort the others: every requested target
+    // is attempted and failures are reported together once the loop is done.
+    let (packaged_outputs, failed_targets) = package_jvm_host_targets_keep_going(
+        packaging_targets
+            .iter()
+            .map(|packaging_target| (packaging_target.cargo_context.host_target, packaging_target)),
+        |packaging_target| {
+            let host_target = packaging_target.cargo_context.host_target.canonical_name();
+            let build_artifacts = run_reported_step(
+                reporter,
+                &format!("Building Rust library for {host_target}"),
+                |step| {
+                    build_jvm_native_library(
+                        packaging_target,
+                        execution.release,
+                        Some(&expansion),
+                        step,
+                    )
+                },
             )?;
-            step.finish_success();
-
-            let step = reporter.step(&format!(
-                "Compiling JNI library for {}",
-                host_target.canonical_name()
-            ));
-            let output = compile_jni_library(config, packaging_target, &build_artifacts, &step)?;
-            step.finish_success();
-            Ok(output)
-        })
-        .collect::<Result<Vec<_>>>()?;
+            run_reported_step(
+                reporter,
+                &format!("Compiling JNI library for {host_target}"),
+                |step| compile_jni_library(config, packaging_target, &build_artifacts, step),
+            )
+        },
+    );
 
     let artifact_name = selected_jvm_package_artifact_name(&packaging_targets)?;
-    if config.java_jvm_debug_symbols_archive_enabled() {
+    // A debug symbols archive missing failed hosts would look complete, so it is
+    // only written when every requested host target packaged successfully.
+    if failed_targets.is_empty() && config.java_jvm_debug_symbols_archive_enabled() {
         let step = reporter.step("Bundling JVM debug symbols");
         write_jvm_debug_symbols(config, artifact_name, &packaged_outputs)?;
         step.finish_success();
     }
+    // Cleanup only touches outputs of targets that packaged successfully or of
+    // hosts that were not requested, so failed targets never cost siblings their
+    // fresh natives or shared resources.
     remove_stale_requested_jvm_shared_library_copies_after_success(
         &config.java_jvm_output(),
         &packaged_outputs,
@@ -232,8 +239,60 @@ fn execute_java_pack(config: &Config, plan: JavaPackPlan, reporter: &Reporter) -
         artifact_name,
     )?;
 
+    if !failed_targets.is_empty() {
+        return Err(jvm_host_targets_failed_error(&failed_targets));
+    }
+
     reporter.finish();
     Ok(())
+}
+
+fn run_reported_step<T>(
+    reporter: &Reporter,
+    message: &str,
+    run: impl FnOnce(&Step) -> Result<T>,
+) -> Result<T> {
+    let step = reporter.step(message);
+    match run(&step) {
+        Ok(value) => {
+            step.finish_success();
+            Ok(value)
+        }
+        Err(error) => {
+            step.finish_failure(&error.to_string());
+            Err(error)
+        }
+    }
+}
+
+fn package_jvm_host_targets_keep_going<T, O>(
+    targets: impl IntoIterator<Item = (JavaHostTarget, T)>,
+    mut package: impl FnMut(T) -> Result<O>,
+) -> (Vec<O>, Vec<(JavaHostTarget, CliError)>) {
+    let mut outputs = Vec::new();
+    let mut failures = Vec::new();
+    targets
+        .into_iter()
+        .for_each(|(host_target, target)| match package(target) {
+            Ok(output) => outputs.push(output),
+            Err(error) => failures.push((host_target, error)),
+        });
+    (outputs, failures)
+}
+
+fn jvm_host_targets_failed_error(failures: &[(JavaHostTarget, CliError)]) -> CliError {
+    let details = failures
+        .iter()
+        .map(|(host_target, error)| format!("{}: {error}", host_target.canonical_name()))
+        .collect::<Vec<_>>()
+        .join("; ");
+    CliError::CommandFailed {
+        command: format!(
+            "JVM packaging failed for {} of the requested host targets ({details})",
+            failures.len()
+        ),
+        status: None,
+    }
 }
 
 fn prepare_java_packaging(
@@ -628,7 +687,8 @@ mod tests {
     use super::{
         ensure_foreign_linux_target_linkable, ensure_glibc_host_targets_supported,
         ensure_java_ir_regeneration, ensure_java_no_build_supported,
-        ensure_jvm_pack_cargo_args_supported, resolve_jvm_packaging_targets,
+        ensure_jvm_pack_cargo_args_supported, jvm_host_targets_failed_error,
+        package_jvm_host_targets_keep_going, resolve_jvm_packaging_targets,
         write_jvm_debug_symbols,
     };
     use crate::build::CargoBuildProfile;
@@ -886,6 +946,51 @@ mod tests {
                 if command.contains("pack java requires regenerated bindings")
         ));
         ensure_java_ir_regeneration(true).expect("regenerated Binding IR packaging should proceed");
+    }
+
+    #[test]
+    fn keeps_packaging_remaining_host_targets_after_one_fails() {
+        let mut attempted = Vec::new();
+        let (outputs, failures) = package_jvm_host_targets_keep_going(
+            [
+                JavaHostTarget::LinuxX86_64,
+                JavaHostTarget::LinuxAarch64,
+                JavaHostTarget::DarwinArm64,
+            ]
+            .map(|host_target| (host_target, host_target)),
+            |host_target| {
+                attempted.push(host_target);
+                match host_target {
+                    JavaHostTarget::LinuxAarch64 => Err(CliError::CommandFailed {
+                        command: "cargo build --target aarch64-unknown-linux-gnu".to_string(),
+                        status: Some(101),
+                    }),
+                    _ => Ok(host_target.canonical_name()),
+                }
+            },
+        );
+
+        assert_eq!(
+            attempted,
+            vec![
+                JavaHostTarget::LinuxX86_64,
+                JavaHostTarget::LinuxAarch64,
+                JavaHostTarget::DarwinArm64,
+            ]
+        );
+        assert_eq!(outputs, vec!["linux-x86_64", "darwin-arm64"]);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].0, JavaHostTarget::LinuxAarch64);
+
+        let error = jvm_host_targets_failed_error(&failures);
+        assert!(matches!(
+            error,
+            CliError::CommandFailed { command, status: None }
+                if command.contains("JVM packaging failed for 1 of the requested host targets")
+                    && command.contains("linux-aarch64: command failed: cargo build --target aarch64-unknown-linux-gnu")
+                    && !command.contains("linux-x86_64")
+                    && !command.contains("darwin-arm64")
+        ));
     }
 
     #[test]
