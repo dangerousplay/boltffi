@@ -26,7 +26,7 @@ use boltffi_binding::{
 use thiserror::Error;
 
 use crate::library_symbols::{self, LibrarySymbolsError};
-use crate::metadata::{BindingMetadataBuild, BindingMetadataBuildError};
+use crate::metadata::{BindingMetadataBuild, BindingMetadataBuildError, CargoRustcCommand};
 use crate::target::Target;
 
 /// Drives one BoltFFI generation from a compiled crate's embedded metadata
@@ -45,6 +45,7 @@ pub struct Generation {
     cargo_args: Vec<String>,
     cargo_environment: Vec<(OsString, OsString)>,
     cargo_toolchain_selector: Option<String>,
+    cargo_rustc_command: Option<CargoRustcCommand>,
     python_package_module: Option<String>,
     python_distribution_name: Option<String>,
     python_package_version: Option<String>,
@@ -99,6 +100,7 @@ impl Generation {
             cargo_args: Vec::new(),
             cargo_environment: Vec::new(),
             cargo_toolchain_selector: None,
+            cargo_rustc_command: None,
             python_package_module: None,
             python_distribution_name: None,
             python_package_version: None,
@@ -172,6 +174,12 @@ impl Generation {
     /// Selects a rustup Cargo toolchain for metadata generation.
     pub fn cargo_toolchain_selector(mut self, toolchain_selector: Option<String>) -> Self {
         self.cargo_toolchain_selector = toolchain_selector;
+        self
+    }
+
+    /// Runs the metadata build through another program than `$CARGO rustc`.
+    pub fn cargo_rustc_command(mut self, rustc_command: Option<CargoRustcCommand>) -> Self {
+        self.cargo_rustc_command = rustc_command;
         self
     }
 
@@ -866,6 +874,9 @@ impl Generation {
         }
         if let Some(triple) = &self.triple {
             build = build.target(triple);
+        }
+        if let Some(rustc_command) = &self.cargo_rustc_command {
+            build = build.rustc_command(rustc_command.clone());
         }
         build
     }
