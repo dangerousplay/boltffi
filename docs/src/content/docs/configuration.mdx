@@ -68,6 +68,31 @@ cargo_args = ["--no-default-features", "--features=kotlin"]
 
 Arguments are passed in this order: `global_args`, `command_args`, the target's `cargo_args`, then any `--cargo-arg` values from the command line.
 
+### Build Command
+
+`build_command` picks the program that runs library builds. Use it to build through [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild) or [cross](https://github.com/cross-rs/cross) instead of plain `cargo`:
+
+```toml
+[cargo]
+build_command = "zigbuild"
+```
+
+| Value | Build | `rustc` builds |
+|-------|-------|----------------|
+| `"cargo"` (default) | `cargo build` | `cargo rustc` |
+| `"zigbuild"` | `cargo-zigbuild zigbuild` | `cargo-zigbuild rustc` |
+| `"cross"` | `cross build` | `cross rustc` |
+| `"<program>"` | `<program> build` | `<program> rustc` |
+| `"<program> <subcommand…>"` | `<program> <subcommand…>` | `<program> <subcommand…>` |
+
+`rustc` builds are the library builds that pass rustc flags: binding-expanded builds, the `pack java` JVM build and its link probes, and the binding metadata build. A custom subcommand is used for both kinds, so it must accept `cargo rustc` arguments. A `+toolchain` selector is passed as an argument only to `cargo`; other programs receive it as `RUSTUP_TOOLCHAIN`. `pack csharp` and `pack python` still build with `cargo`.
+
+The `--cargo-build-cmd` flag overrides the config for one run:
+
+```bash
+boltffi --cargo-build-cmd cross pack java
+```
+
 Each command reads the `cargo_args` of one target table:
 
 - `generate kotlin` and `pack android` use `[targets.android]`. `generate header` uses only the `[cargo]` arguments, but the header step of `pack android` also gets `[targets.android].cargo_args`.
@@ -546,7 +571,18 @@ host_targets = ["current", "linux-x86_64"]
 
 The default output is `dist/java`. This produces Java sources, a C header, JNI glue, a structured native output under `dist/java/native/<host-target>/`, and a flat current-host `_jni` compatibility copy in `dist/java/`. `host_targets` defaults to `["current"]`, supports aliases such as `darwin-aarch64` and `linux-x86-64`, resolves `current` to the active host, and dedupes repeated entries. Requires `JAVA_HOME` and `clang`.
 
-Phase 4 extends JVM packaging from current-host-only output to explicit desktop host matrices. Current-host packaging works on `darwin-arm64`, `darwin-x86_64`, `linux-x86_64`, `linux-aarch64`, and `windows-x86_64`. The initial cross-host parity path is macOS packaging `linux-x86_64`, which requires the Rust target, a configured Linux linker such as `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER` or `BOLTFFI_JAVA_LINKER_X86_64_UNKNOWN_LINUX_GNU`, and target-appropriate JNI headers via either `BOLTFFI_JAVA_HOME_X86_64_UNKNOWN_LINUX_GNU` or `BOLTFFI_JAVA_INCLUDE_X86_64_UNKNOWN_LINUX_GNU`. `pack java` rejects explicit Cargo `--target` passthrough args because the host matrix is controlled by `host_targets`.
+Linux host targets accept a glibc version suffix, such as `linux-x86_64.2.17` or `linux-aarch64.2.28`, to set the oldest glibc the Rust library links against. BoltFFI passes `--target x86_64-unknown-linux-gnu.2.17` to the build command and still reads artifacts from the base triple directory and writes them to `native/linux-x86_64/`. Only [cargo-zigbuild](#build-command) understands the suffix, so it needs `build_command = "zigbuild"` (or a custom command that handles it); `cargo` and `cross` are rejected.
+
+`jni_compiler` replaces the C compiler that builds the JNI glue and links the JNI library for every host target. It is a program followed by leading arguments, split on whitespace:
+
+```toml
+[targets.java.jvm]
+jni_compiler = "zig cc"            # or "clang -fuse-ld=lld", "/opt/llvm/bin/clang"
+```
+
+For `zig cc` and `zig c++`, BoltFFI derives zig's `-target` from the Rust triple and the host target's glibc suffix, so `linux-x86_64.2.17` links with `-target x86_64-linux-gnu.2.17` and `darwin-arm64` with `-target aarch64-macos`. Other programs receive the same target flags as the compiler BoltFFI would have discovered. `jni_compiler` wins over `CARGO_TARGET_<TRIPLE>_LINKER`, cargo `target.<triple>.linker` and `BOLTFFI_JAVA_LINKER_<TRIPLE>` for the JNI library; those still configure the Rust linker.
+
+Phase 4 extends JVM packaging from current-host-only output to explicit desktop host matrices. Current-host packaging works on `darwin-arm64`, `darwin-x86_64`, `linux-x86_64`, `linux-aarch64`, and `windows-x86_64`. The initial cross-host parity path is macOS packaging `linux-x86_64`, which requires the Rust target, a configured Linux linker such as `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER` or `BOLTFFI_JAVA_LINKER_X86_64_UNKNOWN_LINUX_GNU`, and target-appropriate JNI headers via either `BOLTFFI_JAVA_HOME_X86_64_UNKNOWN_LINUX_GNU` or `BOLTFFI_JAVA_INCLUDE_X86_64_UNKNOWN_LINUX_GNU`. Linux hosts can also package the other Linux architecture (`linux-x86_64` ↔ `linux-aarch64`) with `jni_compiler = "zig cc"` and `build_command = "zigbuild"`, or with a target-prefixed cross compiler such as `aarch64-linux-gnu-gcc`; see [Packaging](/docs/packaging#multi-arch-linux-from-one-linux-host). `pack java` rejects explicit Cargo `--target` passthrough args because the host matrix is controlled by `host_targets`.
 
 ### JVM Debug Symbols
 

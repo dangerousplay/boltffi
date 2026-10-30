@@ -7,7 +7,7 @@ use std::sync::mpsc;
 use std::thread;
 
 use crate::cli::{CliError, Result};
-use crate::config::Config;
+use crate::config::{CargoOperation, Config};
 use crate::target::{Platform, RustTarget};
 use crate::toolchain::{AndroidToolchain, AndroidToolchainError};
 
@@ -209,8 +209,7 @@ impl<'a> Builder<'a> {
 
     pub fn build_wasm_with_triple(&self, triple: &str) -> Result<Vec<BuildResult>> {
         let command_args = self.cargo_build_command_args();
-        let mut command = Command::new("cargo");
-        self.apply_cargo_build_prefix(&mut command, &command_args);
+        let mut command = self.cargo_command(&command_args);
         command.arg("--target").arg(triple);
 
         self.apply_common_build_args(&mut command);
@@ -239,8 +238,7 @@ impl<'a> Builder<'a> {
 
     fn host_command(&self) -> Result<Command> {
         let command_args = self.cargo_build_command_args();
-        let mut command = Command::new("cargo");
-        self.apply_cargo_build_prefix(&mut command, &command_args);
+        let mut command = self.cargo_command(&command_args);
         self.apply_common_build_args(&mut command);
         command.args(&command_args.command_args);
         command.arg("--message-format=json-render-diagnostics");
@@ -261,8 +259,7 @@ impl<'a> Builder<'a> {
         android_toolchain: Option<&AndroidToolchain>,
     ) -> Result<BuildResult> {
         let command_args = self.cargo_build_command_args();
-        let mut cmd = Command::new("cargo");
-        self.apply_cargo_build_prefix(&mut cmd, &command_args);
+        let mut cmd = self.cargo_command(&command_args);
         cmd.arg("--target").arg(target.triple());
 
         self.apply_common_build_args(&mut cmd);
@@ -341,22 +338,16 @@ impl<'a> Builder<'a> {
         }
     }
 
-    fn apply_cargo_build_prefix(
-        &self,
-        command: &mut Command,
-        command_args: &CargoBuildCommandArgs,
-    ) {
-        if let Some(toolchain_selector) = command_args.toolchain_selector.as_deref() {
-            command.arg(toolchain_selector);
-        }
-
-        command.arg(
-            if matches!(&self.options.selection, BuildSelection::Expanded(_)) {
-                "rustc"
-            } else {
-                "build"
-            },
-        );
+    fn cargo_command(&self, command_args: &CargoBuildCommandArgs) -> Command {
+        let operation = if matches!(&self.options.selection, BuildSelection::Expanded(_)) {
+            CargoOperation::Rustc
+        } else {
+            CargoOperation::Build
+        };
+        self.config
+            .cargo
+            .build_command
+            .command(operation, command_args.toolchain_selector.as_deref())
     }
 }
 
@@ -574,6 +565,46 @@ name = "demo"
             &arguments[arguments.len() - 3..],
             ["--lib", "--", "--print=native-static-libs"],
             "cargo rejects --print on stable unless it follows the rustc `--`"
+        );
+    }
+
+    #[test]
+    fn library_builds_run_through_the_configured_build_command() {
+        let config: Config = toml::from_str(
+            r#"
+[package]
+name = "demo"
+
+[cargo]
+build_command = "zigbuild"
+"#,
+        )
+        .unwrap();
+        let expansion = BindingExpansion::fixture(
+            "/external/workspace/Cargo.toml",
+            "/external/workspace/demo/Cargo.toml",
+            Vec::new(),
+        );
+        let expanded = Builder::new(
+            &config,
+            BuildOptions {
+                selection: BuildSelection::Expanded(Box::new(expansion)),
+                ..BuildOptions::default()
+            },
+        );
+        let command = expanded.host_command().unwrap();
+        assert_eq!(command.get_program(), "cargo-zigbuild");
+        assert_eq!(command.get_args().next(), Some(OsStr::new("rustc")));
+        assert!(command.get_envs().any(|(key, value)| {
+            key == "RUSTUP_TOOLCHAIN" && value == Some(OsStr::new("nightly"))
+        }));
+
+        let plain = Builder::new(&config, BuildOptions::default());
+        let command = plain.cargo_command(&plain.cargo_build_command_args());
+        assert_eq!(command.get_program(), "cargo-zigbuild");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [OsStr::new("zigbuild")]
         );
     }
 

@@ -63,6 +63,21 @@ Extra arguments for the `cargo` invocations `boltffi` runs.
   - Default: `[]`
 - `command_args` (table of string arrays): Arguments keyed by `boltffi` command. `build` applies to `boltffi build` and `boltffi pack`; `build` and `generate` both apply to `boltffi generate`.
   - Default: `{}`
+- `build_command` (string): Program that runs library builds. The global `--cargo-build-cmd <CMD>` flag overrides it.
+  - Default: `"cargo"`
+  - Values:
+
+    | Value | Build | `rustc` builds |
+    |-------|-------|----------------|
+    | `"cargo"` | `cargo build` | `cargo rustc` |
+    | `"zigbuild"` (also `"cargo zigbuild"`, `"cargo-zigbuild"`) | `cargo-zigbuild zigbuild` | `cargo-zigbuild rustc` |
+    | `"cross"` (also `"cross build"`) | `cross build` | `cross rustc` |
+    | `"<program>"` | `<program> build` | `<program> rustc` |
+    | `"<program> <subcommand…>"` | `<program> <subcommand…>` | `<program> <subcommand…>` |
+
+  - `rustc` builds are binding-expansion library builds, the `pack java` JVM build, its `--print=native-static-libs` / `--print=file-names` probes, and the binding metadata build. A custom subcommand is used for both kinds, so it must accept `cargo rustc` arguments (`--lib`, `-- <rustc flags>`).
+  - A `+toolchain` selector is passed as an argument only when the program is `cargo`; other programs get it as `RUSTUP_TOOLCHAIN`.
+  - The `pack csharp` and `pack python` library builds, `cargo metadata`, and the `pack wasm` target-feature probe always use `cargo`.
 
 Each `[targets.<name>]` table listed below also accepts `cargo_args` (array of strings, default `[]`), applied wherever that target builds:
 
@@ -95,6 +110,7 @@ Arguments are passed in this order: `global_args`, `command_args`, the target's 
 ```toml
 [cargo]
 global_args = ["--locked"]
+build_command = "zigbuild"
 
 [targets.python]
 enabled = true
@@ -352,7 +368,15 @@ Desktop JVM target configuration.
 - `host_targets` (array of strings, optional): Desired desktop native outputs.
   - Supported canonical values: `current`, `darwin-arm64`, `darwin-x86_64`, `linux-x86_64`, `linux-aarch64`, `windows-x86_64`
   - Supported aliases: `darwin-aarch64`, `darwin-x86-64`, `linux-x86-64`, `linux-arm64`, `windows-x86-64`
+  - Linux hosts (and `current` on a Linux machine) accept a glibc version suffix `.<major>.<minor>`, e.g. `linux-x86_64.2.17`. The build command then receives `--target x86_64-unknown-linux-gnu.2.17`; artifacts are still read from `target/x86_64-unknown-linux-gnu/` and written to `native/linux-x86_64/`. Requires a build command that understands the suffix (`[cargo].build_command = "zigbuild"` or a custom command); `cargo` and `cross` reject it. A host may appear only once, with or without a suffix.
   - Default: `["current"]`
+- `jni_compiler` (string, optional): Program, plus leading arguments, that compiles the JNI glue and links the JNI library for every host target, e.g. `"zig cc"` or `"clang -fuse-ld=lld"`.
+  - Split on whitespace (no quoting), like `[cargo].build_command`; must not be empty or start with `-`. The program is looked up in `PATH` unless it contains a path separator.
+  - `zig cc` / `zig c++` receive `-target <zig-target>` derived from the Rust triple, including the glibc suffix of a host target: `linux-x86_64.2.17` → `-target x86_64-linux-gnu.2.17`, `linux-aarch64` → `aarch64-linux-gnu`, `darwin-arm64` → `aarch64-macos`, `windows-x86_64` (gnu) → `x86_64-windows-gnu`. Plain `zig` is rejected.
+  - Other programs get the target flags BoltFFI adds to the compiler it discovers (`--target <triple>` for clang drivers when cross-compiling, `-target`/`-isysroot` on macOS); MSVC drivers (`cl`, `clang-cl`) keep MSVC-style arguments.
+  - Takes precedence over `CARGO_TARGET_<TRIPLE>_LINKER`, cargo `target.<triple>.linker` and `BOLTFFI_JAVA_LINKER_<TRIPLE>` for the JNI library. Those values still configure the Rust linker; on macOS → `linux-x86_64` no separate cross linker is required when `jni_compiler` is set (the build command, e.g. `zigbuild`, links the Rust library).
+  - Default: unset (discover `clang` / the configured linker)
+  - Linux hosts can package the other Linux architecture (`linux-x86_64` ↔ `linux-aarch64`). That needs `jni_compiler` (e.g. `"zig cc"` with `[cargo].build_command = "zigbuild"`), a configured linker (`CARGO_TARGET_<TRIPLE>_LINKER`, cargo `target.<triple>.linker`, `BOLTFFI_JAVA_LINKER_<TRIPLE>`), or a target-prefixed cross compiler in `PATH` (`aarch64-linux-gnu-clang`/`-gcc`, `x86_64-linux-gnu-clang`/`-gcc`). With `build_command = "cargo"` a configured or discovered cross linker is required for the Rust library.
 - `strip_symbols` (bool): Strip symbol tables from packaged desktop JNI libraries for custom named Cargo profiles used with `boltffi pack java`.
   - Default: `false`
   - Currently supported for Darwin and Linux desktop JNI packaging only.

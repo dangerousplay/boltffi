@@ -8,7 +8,7 @@ use crate::build::native_link::{NativeLinkMetadata, parse_native_static_librarie
 use crate::build::{BindingExpansion, CargoBuildProfile, OutputCallback, run_command_streaming};
 use crate::cargo::SelectedLibrary;
 use crate::cli::{CliError, Result};
-use crate::config::Config;
+use crate::config::{CargoOperation, Config};
 use crate::pack::PackError;
 use crate::pack::{format_command_for_log, print_cargo_line, print_verbose_detail};
 use crate::reporter::Step;
@@ -494,6 +494,10 @@ pub(crate) fn compile_jni_library_with_layout(
 
     if step.is_verbose() {
         print_verbose_detail(&format!(
+            "JNI compiler: {}",
+            packaging_target.toolchain.jni_compiler_display()
+        ));
+        print_verbose_detail(&format!(
             "JNI rustflag linker args: {:?}",
             packaging_target.toolchain.jni_rustflag_linker_args()
         ));
@@ -709,21 +713,17 @@ pub(crate) fn build_jvm_native_library(
         command: format!("current_dir: {source}"),
         status: None,
     })?;
-    let mut command = Command::new("cargo");
+    let operation = if binding_expansion.is_some() {
+        CargoOperation::Rustc
+    } else {
+        CargoOperation::Build
+    };
+    let mut command = cargo_context
+        .build_command
+        .command(operation, cargo_context.toolchain_selector.as_deref());
     command.current_dir(crate_directory);
 
-    if let Some(toolchain_selector) = cargo_context.toolchain_selector.as_deref() {
-        command.arg(toolchain_selector);
-    }
-
-    command
-        .arg(if binding_expansion.is_some() {
-            "rustc"
-        } else {
-            "build"
-        })
-        .arg("--target")
-        .arg(&cargo_context.rust_target_triple);
+    command.arg("--target").arg(cargo_context.cargo_target());
     apply_jvm_cargo_package_selection(&mut command, cargo_context);
 
     if release {
@@ -1362,6 +1362,15 @@ pub(crate) fn target_specific_java_include_env_key(rust_target_triple: &str) -> 
     )
 }
 
+/// Link probes run through the configured build command so they see the same
+/// toolchain (`cross` image, zig linker) as the library build they describe.
+fn rustc_probe_command(cargo_context: &JvmCargoContext) -> Command {
+    cargo_context.build_command.command(
+        CargoOperation::Rustc,
+        cargo_context.toolchain_selector.as_deref(),
+    )
+}
+
 pub(crate) fn query_native_link_metadata(
     packaging_target: &JvmPackagingTarget,
     release: bool,
@@ -1372,17 +1381,10 @@ pub(crate) fn query_native_link_metadata(
         status: None,
     })?;
 
-    let mut command = Command::new("cargo");
+    let mut command = rustc_probe_command(cargo_context);
     command.current_dir(crate_directory);
 
-    if let Some(toolchain_selector) = cargo_context.toolchain_selector.as_deref() {
-        command.arg(toolchain_selector);
-    }
-
-    command
-        .arg("rustc")
-        .arg("--target")
-        .arg(&cargo_context.rust_target_triple);
+    command.arg("--target").arg(cargo_context.cargo_target());
     apply_jvm_cargo_package_selection(&mut command, cargo_context);
 
     if release {
@@ -1442,17 +1444,10 @@ fn query_library_filenames(cargo_context: &JvmCargoContext) -> Result<Vec<String
         status: None,
     })?;
 
-    let mut command = Command::new("cargo");
+    let mut command = rustc_probe_command(cargo_context);
     command.current_dir(crate_directory);
 
-    if let Some(toolchain_selector) = cargo_context.toolchain_selector.as_deref() {
-        command.arg(toolchain_selector);
-    }
-
-    command
-        .arg("rustc")
-        .arg("--target")
-        .arg(&cargo_context.rust_target_triple);
+    command.arg("--target").arg(cargo_context.cargo_target());
     apply_jvm_cargo_package_selection(&mut command, cargo_context);
 
     if cargo_context.release {
@@ -1518,7 +1513,7 @@ mod tests {
         handle_missing_linux_strip_program, link_search_path_flags, linux_strip_program_candidates,
         msvc_link_search_path_flags, msvc_native_static_library_flags, msvc_rustflag_linker_args,
         msvc_style_jni_linker_args, resolve_jni_include_directories_with_overrides,
-        resolve_jvm_native_link_input, resolve_linux_strip_program,
+        resolve_jvm_native_link_input, resolve_linux_strip_program, rustc_probe_command,
         select_windows_static_library_filename, should_generate_apple_dsym_sidecars,
         target_prefixed_binutils_prefix, target_prefixed_strip_tool_candidates,
         target_specific_java_home_env_key, target_specific_java_include_env_key,
@@ -1529,7 +1524,7 @@ mod tests {
     use crate::build::CargoBuildProfile;
     use crate::cargo::SelectedLibrary;
     use crate::cli::CliError;
-    use crate::config::{CargoConfig, Config, PackageConfig, TargetsConfig};
+    use crate::config::{CargoBuildCommand, CargoConfig, Config, PackageConfig, TargetsConfig};
     use crate::pack::java::plan::JvmCargoContext;
     use crate::target::JavaHostTarget;
     use crate::toolchain::MsvcStyleCompiler;
@@ -1553,6 +1548,8 @@ mod tests {
             target_directory: root.join("target"),
             cargo_command_args: LibraryCargoArgs::default(),
             toolchain_selector: None,
+            build_command: CargoBuildCommand::Cargo,
+            glibc_version: None,
         }
     }
 
@@ -2234,6 +2231,52 @@ mod tests {
     fn allows_automatic_windows_release_behavior_without_strip_opt_in() {
         validate_desktop_jni_symbol_stripping(&config(false), JavaHostTarget::WindowsX86_64)
             .expect("windows release packaging should remain unchanged without explicit opt-in");
+    }
+
+    #[test]
+    fn glibc_version_changes_the_cargo_target_but_not_the_artifact_directory() {
+        let root = temporary_directory("boltffi-glibc-target");
+        let mut cargo_context = cargo_context(&root, JavaHostTarget::LinuxX86_64);
+        cargo_context.glibc_version = Some("2.17".parse().unwrap());
+
+        assert_eq!(
+            cargo_context.cargo_target(),
+            "x86_64-unknown-linux-gnu.2.17"
+        );
+        assert_eq!(
+            cargo_context.artifact_directory(),
+            root.join("target/x86_64-unknown-linux-gnu/debug")
+        );
+
+        cargo_context.glibc_version = None;
+        assert_eq!(cargo_context.cargo_target(), "x86_64-unknown-linux-gnu");
+    }
+
+    #[test]
+    fn link_probes_run_through_the_configured_build_command() {
+        let root = temporary_directory("boltffi-probe-command");
+        let mut cargo_context = cargo_context(&root, JavaHostTarget::LinuxX86_64);
+        cargo_context.toolchain_selector = Some("+nightly".to_string());
+        let arguments = |command: &Command| {
+            command
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+
+        let command = rustc_probe_command(&cargo_context);
+        assert_eq!(command.get_program(), "cargo");
+        assert_eq!(arguments(&command), ["+nightly", "rustc"]);
+
+        cargo_context.build_command = CargoBuildCommand::Cross;
+        let command = rustc_probe_command(&cargo_context);
+        assert_eq!(command.get_program(), "cross");
+        assert_eq!(arguments(&command), ["rustc"]);
+
+        cargo_context.build_command = CargoBuildCommand::Zigbuild;
+        let command = rustc_probe_command(&cargo_context);
+        assert_eq!(command.get_program(), "cargo-zigbuild");
+        assert_eq!(arguments(&command), ["rustc"]);
     }
 
     #[test]
