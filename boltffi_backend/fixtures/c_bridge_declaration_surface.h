@@ -3,9 +3,14 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#if !defined(__cplusplus) && !defined(_MSC_VER) && (defined(__GNUC__) || defined(__clang__)) && \
+    (!defined(__STDC_VERSION__) || __STDC_VERSION__ < 201112L || defined(__STDC_NO_ATOMICS__) || \
+     (!defined(__clang__) && (__GNUC__ < 4 || (__GNUC__ == 4 && __GNUC_MINOR__ < 9))))
+#define BOLTFFI_C_ATOMIC_BUILTINS 1
+#endif
 #if defined(_MSC_VER)
 #include <intrin.h>
-#elif !defined(__cplusplus)
+#elif !defined(__cplusplus) && !defined(BOLTFFI_C_ATOMIC_BUILTINS)
 #include <stdatomic.h>
 #endif
 
@@ -81,7 +86,7 @@ static inline bool boltffi_atomic_u64_cas(uint64_t *slot, uint64_t expected, uin
 static inline uint64_t boltffi_atomic_u64_load(uint64_t *slot) {
     return (uint64_t)_InterlockedCompareExchange64((volatile __int64 *)slot, 0, 0);
 }
-#elif defined(__cplusplus) && (defined(__clang__) || defined(__GNUC__))
+#elif (defined(__cplusplus) && (defined(__clang__) || defined(__GNUC__))) || defined(BOLTFFI_C_ATOMIC_BUILTINS)
 static inline bool boltffi_atomic_u8_cas(uint8_t *state, uint8_t expected, uint8_t desired) {
     return __atomic_compare_exchange_n(state, &expected, desired, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
 }
