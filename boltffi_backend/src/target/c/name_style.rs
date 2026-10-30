@@ -1,6 +1,6 @@
 //! C identifier and naming rules for the ergonomic C host layer.
 
-use boltffi_binding::CanonicalName;
+use boltffi_binding::{CanonicalName, NamePart};
 
 use crate::core::name_case;
 
@@ -17,10 +17,34 @@ pub struct Name {
 
 impl Name {
     /// Creates a C name from a source canonical name.
+    ///
+    /// A Cargo package name such as `my-lib` reaches the C host as one part;
+    /// `-` cannot appear in a C identifier, so it splits the part in two.
     pub fn new(source: &CanonicalName) -> Self {
-        Self {
-            source: source.clone(),
+        if !source
+            .parts()
+            .iter()
+            .any(|part| part.as_str().contains('-'))
+        {
+            return Self {
+                source: source.clone(),
+            };
         }
+        let parts = source
+            .parts()
+            .iter()
+            .flat_map(|part| part.as_str().split('-'))
+            .filter(|part| !part.is_empty())
+            .map(NamePart::new)
+            .collect();
+        Self {
+            source: CanonicalName::new(parts),
+        }
+    }
+
+    /// The canonical name this C spelling is derived from.
+    pub(crate) fn source(&self) -> &CanonicalName {
+        &self.source
     }
 
     pub(crate) fn field(
@@ -72,6 +96,14 @@ mod tests {
 
     fn name(parts: &[&str]) -> CanonicalName {
         CanonicalName::new(parts.iter().map(|part| NamePart::new(*part)).collect())
+    }
+
+    #[test]
+    fn hyphenated_package_names_spell_valid_identifiers() {
+        let package = Name::new(&name(&["my-lib"]));
+        assert_eq!(package.member(), "my_lib");
+        assert_eq!(package.constant(), "MY_LIB");
+        assert_eq!(package.r#type(), "MyLib");
     }
 
     #[test]
