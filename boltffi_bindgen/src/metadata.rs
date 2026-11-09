@@ -825,16 +825,33 @@ impl MetadataArtifact {
 
     /// Whether the artifact sits under `<target-dir>/<target>/<profile>/`, where
     /// Cargo places target units once `--target` is explicit.
+    /// `cargo zigbuild` accepts a glibc floor suffix (`x86_64-unknown-linux-gnu.2.17`)
+    /// but writes into the plain triple directory, so the suffix is dropped here.
     fn built_for(&self, target: &str) -> bool {
         let directory = match target.strip_suffix(".json") {
             Some(_) => Path::new(target).file_stem(),
-            None => Some(OsStr::new(target)),
+            None => Some(OsStr::new(Self::without_glibc_suffix(target))),
         };
         self.path
             .ancestors()
             .skip(1)
             .take(3)
             .any(|ancestor| ancestor.file_name() == directory)
+    }
+
+    /// `<triple>.<major>.<minor>` → `<triple>`; other targets are returned unchanged.
+    fn without_glibc_suffix(target: &str) -> &str {
+        let mut parts = target.rsplitn(3, '.');
+        let (Some(minor), Some(major), Some(triple)) = (parts.next(), parts.next(), parts.next())
+        else {
+            return target;
+        };
+        let numeric = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+        if numeric(major) && numeric(minor) && triple.ends_with("-gnu") {
+            triple
+        } else {
+            target
+        }
     }
 
     fn metadata_extension(extension: &str) -> bool {
@@ -901,6 +918,20 @@ mod tests {
     };
     use crate::artifact::BindingMetadataReader;
     use crate::cargo::LibraryCargoArgsError;
+
+    #[test]
+    fn zigbuild_glibc_suffix_matches_plain_triple_directory() {
+        let artifact = super::MetadataArtifact {
+            path: PathBuf::from("/t/target/x86_64-unknown-linux-gnu/release/libfoo.so"),
+        };
+        assert!(artifact.built_for("x86_64-unknown-linux-gnu.2.17"));
+        assert!(artifact.built_for("x86_64-unknown-linux-gnu"));
+        assert!(!artifact.built_for("aarch64-unknown-linux-gnu.2.17"));
+        assert_eq!(
+            super::MetadataArtifact::without_glibc_suffix("thumbv7em-none-eabi"),
+            "thumbv7em-none-eabi"
+        );
+    }
 
     #[test]
     fn metadata_build_tracks_rustup_toolchain_selector_separately() {
